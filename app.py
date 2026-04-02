@@ -98,16 +98,16 @@ if menu == "적립금 지급하기":
             target_df.columns = req_cols + ['금액']
             target_df['금액'] = pd.to_numeric(target_df['금액'], errors='coerce').fillna(0)
 
-            # --- [중복 체크 로직 수정 부분] ---
+            # --- [중복 체크 로직: 데이터 타입 에러 수정] ---
             try:
                 db_df = pd.read_sql(f"SELECT {', '.join(req_cols)}, 금액 FROM mileage_records", con=engine)
-                # 각 행을 문자열로 합쳐서 고유 키 생성
-                existing_keys = set(db_df.astype(str).apply(lambda x: '|'.join(x), axis=1).tolist())
+                # 모든 데이터를 문자열로 변환한 뒤 합치기
+                existing_keys = set(db_df.astype(str).apply(lambda x: '|'.join(x.fillna('')), axis=1).tolist())
             except:
                 existing_keys = set()
             
-            # 현재 업로드한 데이터의 고유 키 생성
-            current_keys = target_df.astype(str).apply(lambda x: '|'.join(x), axis=1)
+            # 현재 업로드 데이터도 동일하게 모든 열을 문자열로 변환 후 합치기
+            current_keys = target_df.astype(str).apply(lambda x: '|'.join(x.fillna('')), axis=1)
             target_df['DB상태'] = current_keys.apply(lambda x: '🚨 중복' if x in existing_keys else '✅ 신규')
             
             target_df.insert(0, '삭제선택', False)

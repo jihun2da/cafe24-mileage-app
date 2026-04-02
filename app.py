@@ -49,28 +49,24 @@ def get_access_token(auth_code):
 # ==========================================
 st.header("🔑 STEP 1: 카페24 계정 연동 (필수)")
 
-# 카페24에서 리다이렉트로 돌아왔을 때 코드 낚아채기
 if "code" in st.query_params and "access_token" not in st.session_state:
     auth_code = st.query_params["code"]
     with st.spinner("🔄 카페24 인증을 자동으로 처리하고 있습니다..."):
         token = get_access_token(auth_code)
         if token:
             st.session_state["access_token"] = token
-            # 주소창 코드 지우기 (새로고침 시 오류 방지)
             st.query_params.clear()
         else:
             st.error("❌ 토큰 발급에 실패했습니다. API 키를 확인해주세요.")
 
-# 로그인이 안 되어 있으면 여기서 멈춤 (엑셀 업로드 창 안 보여줌)
 if "access_token" not in st.session_state:
     st.warning("⚠️ 적립금 작업을 시작하려면 먼저 카페24 쇼핑몰 연동이 필요합니다.")
     auth_url = f"https://{MALL_ID}.cafe24api.com/api/v2/oauth/authorize?response_type=code&client_id={CLIENT_ID}&state=random&redirect_uri={urllib.parse.quote(REDIRECT_URI)}&scope={SCOPE}"
     st.link_button("🔐 카페24 로그인 및 연동하기", auth_url, type="primary")
     st.info("💡 연동을 완료해야 다음 단계(엑셀 업로드)가 나타납니다.")
-    st.stop() # 🛑 로그인을 안 하면 아래 코드는 실행되지 않음!
+    st.stop()
 else:
     st.success("✅ 카페24 시스템과 성공적으로 연결되었습니다! 이제 안심하고 아래 작업을 진행하세요.")
-
 
 # ==========================================
 # STEP 2: 엑셀 파일 업로드
@@ -151,16 +147,17 @@ if uploaded_file:
                         st.success("🎉 DB 저장 완료!")
 
             with col2:
-                # 로그인 상태이므로 무조건 쏘기 버튼 활성화!
                 if st.button("🚀 2. 카페24로 적립금 자동 쏘기 (API)", type="primary", use_container_width=True):
                     if not bulk_reason.strip():
                         st.warning("⚠️ 일괄 비고(사유)를 입력해야 전송할 수 있습니다.")
                     else:
                         url = f"https://{MALL_ID}.cafe24api.com/api/v2/admin/points"
+                        
+                        # 🚨 [수정된 부분] API 버전을 2026-03-01로 변경했습니다! 🚨
                         headers = {
                             "Authorization": f"Bearer {st.session_state['access_token']}",
                             "Content-Type": "application/json",
-                            "X-Cafe24-Api-Version": "2024-03-01"
+                            "X-Cafe24-Api-Version": "2026-03-01" 
                         }
 
                         success_count, fail_count = 0, 0
@@ -192,6 +189,7 @@ if uploaded_file:
 
                         if fail_count == 0:
                             st.success(f"🎉 총 {success_count}명에게 카페24 적립금 자동 전송을 완벽하게 완료했습니다!")
+                            del st.session_state["access_token"] # 성공 후 토큰 초기화
                         else:
                             st.warning(f"전송 완료. 성공: {success_count}건 / 실패: {fail_count}건")
 

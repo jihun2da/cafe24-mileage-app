@@ -49,7 +49,6 @@ CLIENT_SECRET = cafe24_info["client_secret"]
 REDIRECT_URI = "https://cafe24-mileage-app.streamlit.app"
 SCOPE = "mall.read_customer,mall.write_customer,mall.read_mileage,mall.write_mileage"
 
-# --- [공통 함수] ---
 def get_access_token(auth_code):
     url = f"https://{MALL_ID}.cafe24api.com/api/v2/oauth/token"
     auth_str = f"{CLIENT_ID}:{CLIENT_SECRET}"
@@ -98,22 +97,34 @@ if menu == "적립금 지급하기":
             target_df.columns = req_cols + ['금액']
             target_df['금액'] = pd.to_numeric(target_df['금액'], errors='coerce').fillna(0)
 
-            # --- [중복 체크 로직: 데이터 타입 에러 수정] ---
+            # 중복 체크
             try:
                 db_df = pd.read_sql(f"SELECT {', '.join(req_cols)}, 금액 FROM mileage_records", con=engine)
-                # 모든 데이터를 문자열로 변환한 뒤 합치기
                 existing_keys = set(db_df.astype(str).apply(lambda x: '|'.join(x.fillna('')), axis=1).tolist())
             except:
                 existing_keys = set()
             
-            # 현재 업로드 데이터도 동일하게 모든 열을 문자열로 변환 후 합치기
             current_keys = target_df.astype(str).apply(lambda x: '|'.join(x.fillna('')), axis=1)
             target_df['DB상태'] = current_keys.apply(lambda x: '🚨 중복' if x in existing_keys else '✅ 신규')
-            
             target_df.insert(0, '삭제선택', False)
             target_df.loc[target_df['DB상태'] == '🚨 중복', '삭제선택'] = True
             
-            st.info("💡 중복 건은 자동으로 체크되었습니다. 합산 전 확인해 주세요.")
+            st.info("💡 중복 건은 자동으로 체크되었습니다. [중복 데이터 다운로드] 버튼으로 내역을 보관할 수 있습니다.")
+            
+            # --- 📥 중복 데이터 다운로드 기능 추가 ---
+            duplicate_only = target_df[target_df['DB상태'] == '🚨 중복'].drop(columns=['삭제선택'])
+            if not duplicate_only.empty:
+                dup_out = io.BytesIO()
+                with pd.ExcelWriter(dup_out, engine='xlsxwriter') as writer:
+                    duplicate_only.to_excel(writer, index=False)
+                st.download_button(
+                    label=f"📥 중복 데이터만 다운로드 ({len(duplicate_only)}건)",
+                    data=dup_out.getvalue(),
+                    file_name=f"duplicates_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            # ------------------------------------------
+
             edited_df = st.data_editor(target_df, hide_index=True, use_container_width=True)
 
             if st.button("🔄 체크 항목 제외 후 합산하기", type="secondary"):

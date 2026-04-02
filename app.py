@@ -98,17 +98,23 @@ if menu == "적립금 지급하기":
             target_df.columns = req_cols + ['금액']
             target_df['금액'] = pd.to_numeric(target_df['금액'], errors='coerce').fillna(0)
 
-            db_df = pd.read_sql("SELECT 아이디, 주문자명, 고객명, 브랜드, 상품, 색상, 사이즈, 금액 FROM mileage_records", con=engine)
-            db_df['key'] = db_df.astype(str).apply('|'.join, axis=1)
-            existing_keys = set(db_df['key'].tolist())
+            # --- [중복 체크 로직 수정 부분] ---
+            try:
+                db_df = pd.read_sql(f"SELECT {', '.join(req_cols)}, 금액 FROM mileage_records", con=engine)
+                # 각 행을 문자열로 합쳐서 고유 키 생성
+                existing_keys = set(db_df.astype(str).apply(lambda x: '|'.join(x), axis=1).tolist())
+            except:
+                existing_keys = set()
             
-            target_df['key'] = target_df.astype(str).apply('|'.join, axis=1)
-            target_df['DB상태'] = target_df['key'].apply(lambda x: '🚨 중복' if x in existing_keys else '✅ 신규')
+            # 현재 업로드한 데이터의 고유 키 생성
+            current_keys = target_df.astype(str).apply(lambda x: '|'.join(x), axis=1)
+            target_df['DB상태'] = current_keys.apply(lambda x: '🚨 중복' if x in existing_keys else '✅ 신규')
+            
             target_df.insert(0, '삭제선택', False)
             target_df.loc[target_df['DB상태'] == '🚨 중복', '삭제선택'] = True
             
             st.info("💡 중복 건은 자동으로 체크되었습니다. 합산 전 확인해 주세요.")
-            edited_df = st.data_editor(target_df.drop(columns=['key']), hide_index=True, use_container_width=True)
+            edited_df = st.data_editor(target_df, hide_index=True, use_container_width=True)
 
             if st.button("🔄 체크 항목 제외 후 합산하기", type="secondary"):
                 cleaned = edited_df[edited_df['삭제선택'] == False].drop(columns=['삭제선택', 'DB상태'])

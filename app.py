@@ -40,9 +40,10 @@ def get_access_token(auth_code):
     }
     response = requests.post(url, headers=headers, data=data)
     if response.status_code == 200:
-        return response.json().get("access_token")
+        return response.json().get("access_token"), None
     else:
-        return None
+        # 카페24가 알려주는 정확한 실패 사유를 반환합니다.
+        return None, response.text 
 
 # ==========================================
 # STEP 1: 카페24 연동 (가장 먼저 실행!)
@@ -52,12 +53,18 @@ st.header("🔑 STEP 1: 카페24 계정 연동 (필수)")
 if "code" in st.query_params and "access_token" not in st.session_state:
     auth_code = st.query_params["code"]
     with st.spinner("🔄 카페24 인증을 자동으로 처리하고 있습니다..."):
-        token = get_access_token(auth_code)
+        token, error_msg = get_access_token(auth_code)
         if token:
             st.session_state["access_token"] = token
             st.query_params.clear()
+            st.rerun() # 성공하면 깔끔하게 화면 새로고침
         else:
-            st.error("❌ 토큰 발급에 실패했습니다. API 키를 확인해주세요.")
+            # 🚨 실패 시 상세 에러 메시지를 화면에 뿌려줍니다!
+            st.error(f"❌ 토큰 발급에 실패했습니다. 상세 원인: {error_msg}")
+            if st.button("🔄 에러 지우고 처음부터 다시 시도하기"):
+                st.query_params.clear()
+                st.rerun()
+            st.stop()
 
 if "access_token" not in st.session_state:
     st.warning("⚠️ 적립금 작업을 시작하려면 먼저 카페24 쇼핑몰 연동이 필요합니다.")
@@ -152,8 +159,6 @@ if uploaded_file:
                         st.warning("⚠️ 일괄 비고(사유)를 입력해야 전송할 수 있습니다.")
                     else:
                         url = f"https://{MALL_ID}.cafe24api.com/api/v2/admin/points"
-                        
-                        # 🚨 [수정된 부분] API 버전을 2026-03-01로 변경했습니다! 🚨
                         headers = {
                             "Authorization": f"Bearer {st.session_state['access_token']}",
                             "Content-Type": "application/json",
@@ -189,7 +194,7 @@ if uploaded_file:
 
                         if fail_count == 0:
                             st.success(f"🎉 총 {success_count}명에게 카페24 적립금 자동 전송을 완벽하게 완료했습니다!")
-                            del st.session_state["access_token"] # 성공 후 토큰 초기화
+                            del st.session_state["access_token"] 
                         else:
                             st.warning(f"전송 완료. 성공: {success_count}건 / 실패: {fail_count}건")
 

@@ -20,25 +20,33 @@ def init_connection():
 engine = init_connection()
 
 def prepare_db():
-    # 주문일 컬럼이 포함된 테이블 생성 쿼리
-    create_table_sql = """
-    CREATE TABLE IF NOT EXISTS mileage_records (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        아이디 VARCHAR(255),
-        주문자명 VARCHAR(255),
-        고객명 VARCHAR(255),
-        브랜드 VARCHAR(255),
-        상품 TEXT,
-        색상 VARCHAR(100),
-        사이즈 VARCHAR(100),
-        주문일 VARCHAR(100),
-        금액 INT,
-        비고 TEXT,
-        지급일시 DATETIME DEFAULT CURRENT_TIMESTAMP
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    """
     with engine.connect() as conn:
-        conn.execute(text(create_table_sql))
+        # 1. 테이블 생성 (주문일 포함)
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS mileage_records (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                아이디 VARCHAR(255),
+                주문자명 VARCHAR(255),
+                고객명 VARCHAR(255),
+                브랜드 VARCHAR(255),
+                상품 TEXT,
+                색상 VARCHAR(100),
+                사이즈 VARCHAR(100),
+                주문일 VARCHAR(100),
+                금액 INT,
+                비고 TEXT,
+                지급일시 DATETIME DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """))
+        
+        # 2. 🚨 기존 테이블에 '주문일' 컬럼이 없는 경우 강제로 추가 (Unknown column 에러 방지)
+        try:
+            # 컬럼 존재 여부 확인 후 없으면 추가
+            conn.execute(text("ALTER TABLE mileage_records ADD COLUMN 주문일 VARCHAR(100) AFTER 사이즈;"))
+            conn.commit()
+        except:
+            # 이미 컬럼이 있는 경우 발생하는 에러는 무시합니다.
+            pass
         conn.commit()
 
 prepare_db()
@@ -49,7 +57,7 @@ MALL_ID = cafe24_info["mall_id"]
 CLIENT_ID = cafe24_info["client_id"]
 CLIENT_SECRET = cafe24_info["client_secret"]
 REDIRECT_URI = "https://cafe24-mileage-app.streamlit.app"
-SCOPE = "mall.read_customer,mall.write_customer,mall.read_mileage,mall.write_mileage,mall.read_mileage,mall.write_mileage"
+SCOPE = "mall.read_customer,mall.write_customer,mall.read_mileage,mall.write_mileage"
 
 def get_access_token(auth_code):
     url = f"https://{MALL_ID}.cafe24api.com/api/v2/oauth/token"
@@ -84,7 +92,7 @@ if menu == "적립금 지급하기":
         st.link_button("🔐 카페24 로그인 및 연동하기", auth_url, type="primary")
         st.stop()
     else:
-        st.success("✅ 카페24 연결 성공!")
+        st.success(f"✅ {MALL_ID} 연결 성공!")
 
     uploaded_file = st.file_uploader("📂 엑셀 파일 업로드", type=["xlsx", "xls", "csv"])
 
@@ -93,13 +101,13 @@ if menu == "적립금 지급하기":
             df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith(('xlsx', 'xls')) else pd.read_csv(uploaded_file)
             df.columns = df.columns.astype(str).str.strip()
             
-            # 컬럼 자동 매핑 (주문일 추가)
+            # 컬럼 자동 매핑
             amt_col = next((n for n in ['적립금액', '적립금', '금액', '결제금액'] if n in df.columns), None)
             date_col = next((n for n in ['주문일', '주문일시', '날짜'] if n in df.columns), None)
             req_cols = ['아이디', '주문자명', '고객명', '브랜드', '상품', '색상', '사이즈']
             
             if not date_col:
-                st.error("⚠️ 엑셀 파일에서 '주문일' 컬럼을 찾을 수 없습니다.")
+                st.error("⚠️ 엑셀 파일에서 '주문일' 컬럼을 찾을 수 없습니다. (주문일, 주문일시, 날짜 중 하나 필요)")
                 st.stop()
 
             target_df = df[req_cols + [date_col, amt_col]].copy()
@@ -109,7 +117,6 @@ if menu == "적립금 지급하기":
 
             # --- [중복 체크 로직: 주문일 포함] ---
             try:
-                # DB에서 기존 데이터 로드 (주문일 컬럼 포함)
                 db_df = pd.read_sql(f"SELECT {', '.join(req_cols)}, 주문일, 금액 FROM mileage_records", con=engine)
                 existing_keys = set(db_df.astype(str).apply(lambda x: '|'.join(x.fillna('')), axis=1).tolist())
             except:
@@ -120,20 +127,13 @@ if menu == "적립금 지급하기":
             target_df.insert(0, '삭제선택', False)
             target_df.loc[target_df['DB상태'] == '🚨 중복', '삭제선택'] = True
             
-            st.info("💡 중복 건은 자동으로 체크되었습니다. [중복 데이터 다운로드] 버튼으로 내역을 보관할 수 있습니다.")
-            
-            # --- 📥 중복 데이터 다운로드 기능 ---
+            # 중복 데이터 다운로드
             duplicate_only = target_df[target_df['DB상태'] == '🚨 중복'].drop(columns=['삭제선택'])
             if not duplicate_only.empty:
                 dup_out = io.BytesIO()
                 with pd.ExcelWriter(dup_out, engine='xlsxwriter') as writer:
                     duplicate_only.to_excel(writer, index=False)
-                st.download_button(
-                    label=f"📥 중복 데이터만 다운로드 ({len(duplicate_only)}건)",
-                    data=dup_out.getvalue(),
-                    file_name=f"duplicates_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
+                st.download_button(label=f"📥 중복 데이터 다운로드 ({len(duplicate_only)}건)", data=dup_out.getvalue(), file_name="duplicates.xlsx")
 
             edited_df = st.data_editor(target_df, hide_index=True, use_container_width=True)
 
@@ -152,25 +152,17 @@ if menu == "적립금 지급하기":
                 st.dataframe(s_df, use_container_width=True, hide_index=True)
                 
                 action = st.radio("작업 선택", ["적립금 추가 (지급)", "적립금 차감 (회수)"])
-                reason = st.text_input("📝 사유 입력 (API 전송 시 필수)")
+                reason = st.text_input("📝 사유 입력")
                 
                 b1, b2 = st.columns(2)
                 with b1:
                     if st.button("💾 1. 원본 상세 내역을 DB에 기록", use_container_width=True, type="primary"):
-                        st.session_state['db_confirm'] = True
-                    if st.session_state.get('db_confirm'):
-                        st.warning("❓ 상세 내역을 DB에 저장하시겠습니까?")
-                        cc1, cc2 = st.columns(2)
-                        if cc1.button("⭕ 예 (저장)", use_container_width=True):
-                            save_df = st.session_state['cleaned_df'].copy()
-                            save_df['비고'] = f"[{action}] {reason if reason.strip() else '상세내역 기록'}"
-                            save_df['지급일시'] = datetime.now()
-                            save_df.to_sql(name='mileage_records', con=engine, if_exists='append', index=False)
-                            st.success("🎉 DB 저장 완료!")
-                            st.session_state['db_confirm'] = False
-                        if cc2.button("❌ 아니요 (취소)", use_container_width=True):
-                            st.session_state['db_confirm'] = False
-                            st.rerun()
+                        save_df = st.session_state['cleaned_df'].copy()
+                        save_df['비고'] = f"[{action}] {reason if reason.strip() else '상세내역 기록'}"
+                        save_df['지급일시'] = datetime.now()
+                        # DB에 저장 시 컬럼 순서 일치시키기
+                        save_df.to_sql(name='mileage_records', con=engine, if_exists='append', index=False)
+                        st.success("🎉 DB 저장 완료!")
 
                 with b2:
                     if st.button(f"🚀 2. 카페24로 {action} 실행", use_container_width=True, type="primary"):

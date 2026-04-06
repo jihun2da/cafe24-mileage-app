@@ -47,7 +47,7 @@ MALL_ID = cafe24_info["mall_id"]
 CLIENT_ID = cafe24_info["client_id"]
 CLIENT_SECRET = cafe24_info["client_secret"]
 REDIRECT_URI = "https://cafe24-mileage-app.streamlit.app"
-SCOPE = "mall.read_customer,mall.write_customer"
+SCOPE = "mall.read_customer,mall.write_customer,mall.read_mileage,mall.write_mileage,mall.read_mileage,mall.write_mileage"
 
 def get_access_token(auth_code):
     url = f"https://{MALL_ID}.cafe24api.com/api/v2/oauth/token"

@@ -8,10 +8,8 @@ import urllib.parse
 import io
 from datetime import datetime
 
-# --- [페이지 설정] ---
 st.set_page_config(page_title="카페24 적립금 통합 관리 시스템", layout="wide")
 
-# --- [DB 연결 및 초기화] ---
 @st.cache_resource
 def init_connection():
     db_info = st.secrets["mysql"]
@@ -20,7 +18,6 @@ def init_connection():
 engine = init_connection()
 
 def prepare_db():
-    # [주문일] 컬럼이 추가된 테이블 생성 쿼리
     create_table_sql = """
     CREATE TABLE IF NOT EXISTS mileage_records (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -43,13 +40,11 @@ def prepare_db():
 
 prepare_db()
 
-# --- [카페24 설정 정보] ---
 cafe24_info = st.secrets["cafe24"]
 MALL_ID = cafe24_info["mall_id"]
 CLIENT_ID = cafe24_info["client_id"]
 CLIENT_SECRET = cafe24_info["client_secret"]
 REDIRECT_URI = "https://cafe24-mileage-app.streamlit.app"
-# 사용자님의 앱 설정 이미지에 맞춘 묶음형 SCOPE 적용
 SCOPE = "mall.read_customer,mall.write_customer,mall.read_mileage,mall.write_mileage"
 
 def get_access_token(auth_code):
@@ -63,16 +58,11 @@ def get_access_token(auth_code):
         return response.json().get("access_token"), None
     return None, response.text
 
-# --- [사이드바 메뉴] ---
 st.sidebar.title("🚀 메뉴 선택")
 menu = st.sidebar.radio("원하시는 작업을 선택하세요", ["적립금 지급하기", "기록 조회 및 다운로드", "DB 기록 삭제"])
 
-# ==========================================
-# 화면 1: 적립금 지급하기
-# ==========================================
 if menu == "적립금 지급하기":
     st.title("💰 적립금 자동 지급/차감 시스템")
-    
     if "code" in st.query_params and "access_token" not in st.session_state:
         auth_code = st.query_params["code"]
         token, err = get_access_token(auth_code)
@@ -81,7 +71,7 @@ if menu == "적립금 지급하기":
             st.query_params.clear()
             st.rerun()
         else:
-            st.error("❌ 연동 실패! (Scope 권한 설정을 확인하세요)")
+            st.error("❌ 연동 실패!")
             st.code(err)
             st.stop()
 
@@ -98,15 +88,12 @@ if menu == "적립금 지급하기":
         try:
             df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith(('xlsx', 'xls')) else pd.read_csv(uploaded_file)
             df.columns = df.columns.astype(str).str.strip()
-            
-            # 컬럼 매핑 (주문일 추가)
             amt_col = next((n for n in ['적립금액', '적립금', '금액', '결제금액'] if n in df.columns), None)
             date_col = next((n for n in ['주문일', '주문일시', '날짜'] if n in df.columns), None)
             req_cols = ['아이디', '주문자명', '고객명', '브랜드', '상품', '색상', '사이즈']
             
-            # 필수 컬럼 존재 확인
             if not date_col:
-                st.error("⚠️ 엑셀 파일에 '주문일' 컬럼이 없습니다. 확인해 주세요.")
+                st.error("⚠️ 엑셀 파일에 '주문일' 컬럼이 없습니다.")
                 st.stop()
 
             target_df = df[req_cols + [date_col, amt_col]].copy()
@@ -114,9 +101,7 @@ if menu == "적립금 지급하기":
             target_df['금액'] = pd.to_numeric(target_df['금액'], errors='coerce').fillna(0)
             target_df['주문일'] = target_df['주문일'].astype(str).str.strip()
 
-            # --- [중복 체크 로직: 주문일 포함] ---
             try:
-                # DB에서 기존 데이터 로드 (주문일 포함)
                 db_df = pd.read_sql(f"SELECT {', '.join(req_cols)}, 주문일, 금액 FROM mileage_records", con=engine)
                 existing_keys = set(db_df.astype(str).apply(lambda x: '|'.join(x.fillna('')), axis=1).tolist())
             except:
@@ -127,7 +112,6 @@ if menu == "적립금 지급하기":
             target_df.insert(0, '삭제선택', False)
             target_df.loc[target_df['DB상태'] == '🚨 중복', '삭제선택'] = True
             
-            # 중복 데이터 다운로드
             duplicate_only = target_df[target_df['DB상태'] == '🚨 중복'].drop(columns=['삭제선택'])
             if not duplicate_only.empty:
                 dup_out = io.BytesIO()
@@ -179,9 +163,6 @@ if menu == "적립금 지급하기":
                             del st.session_state["access_token"]
         except Exception as e: st.error(f"오류: {e}")
 
-# ==========================================
-# 화면 2: 기록 조회 및 다운로드
-# ==========================================
 elif menu == "기록 조회 및 다운로드":
     st.title("🔍 DB 기록 조회 및 다운로드")
     try:
@@ -193,9 +174,6 @@ elif menu == "기록 조회 및 다운로드":
             st.download_button(label="📥 전체 기록 다운로드", data=out.getvalue(), file_name="history.xlsx")
     except: st.info("기록이 없습니다.")
 
-# ==========================================
-# 화면 3: DB 기록 삭제
-# ==========================================
 elif menu == "DB 기록 삭제":
     st.title("🗑️ DB 기록 삭제 (묶음별)")
     try:

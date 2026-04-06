@@ -39,13 +39,11 @@ def prepare_db():
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """))
         
-        # 2. 🚨 기존 테이블에 '주문일' 컬럼이 없는 경우 강제로 추가 (Unknown column 에러 방지)
+        # 2. 기존 테이블에 '주문일' 컬럼이 없는 경우 강제로 추가
         try:
-            # 컬럼 존재 여부 확인 후 없으면 추가
             conn.execute(text("ALTER TABLE mileage_records ADD COLUMN 주문일 VARCHAR(100) AFTER 사이즈;"))
             conn.commit()
         except:
-            # 이미 컬럼이 있는 경우 발생하는 에러는 무시합니다.
             pass
         conn.commit()
 
@@ -101,13 +99,12 @@ if menu == "적립금 지급하기":
             df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith(('xlsx', 'xls')) else pd.read_csv(uploaded_file)
             df.columns = df.columns.astype(str).str.strip()
             
-            # 컬럼 자동 매핑
             amt_col = next((n for n in ['적립금액', '적립금', '금액', '결제금액'] if n in df.columns), None)
             date_col = next((n for n in ['주문일', '주문일시', '날짜'] if n in df.columns), None)
             req_cols = ['아이디', '주문자명', '고객명', '브랜드', '상품', '색상', '사이즈']
             
             if not date_col:
-                st.error("⚠️ 엑셀 파일에서 '주문일' 컬럼을 찾을 수 없습니다. (주문일, 주문일시, 날짜 중 하나 필요)")
+                st.error("⚠️ 엑셀 파일에서 '주문일' 컬럼을 찾을 수 없습니다.")
                 st.stop()
 
             target_df = df[req_cols + [date_col, amt_col]].copy()
@@ -115,7 +112,6 @@ if menu == "적립금 지급하기":
             target_df['금액'] = pd.to_numeric(target_df['금액'], errors='coerce').fillna(0)
             target_df['주문일'] = target_df['주문일'].astype(str).str.strip()
 
-            # --- [중복 체크 로직: 주문일 포함] ---
             try:
                 db_df = pd.read_sql(f"SELECT {', '.join(req_cols)}, 주문일, 금액 FROM mileage_records", con=engine)
                 existing_keys = set(db_df.astype(str).apply(lambda x: '|'.join(x.fillna('')), axis=1).tolist())
@@ -127,7 +123,6 @@ if menu == "적립금 지급하기":
             target_df.insert(0, '삭제선택', False)
             target_df.loc[target_df['DB상태'] == '🚨 중복', '삭제선택'] = True
             
-            # 중복 데이터 다운로드
             duplicate_only = target_df[target_df['DB상태'] == '🚨 중복'].drop(columns=['삭제선택'])
             if not duplicate_only.empty:
                 dup_out = io.BytesIO()
@@ -156,13 +151,23 @@ if menu == "적립금 지급하기":
                 
                 b1, b2 = st.columns(2)
                 with b1:
+                    # 🚨 [컨펌 로직 복구]
                     if st.button("💾 1. 원본 상세 내역을 DB에 기록", use_container_width=True, type="primary"):
-                        save_df = st.session_state['cleaned_df'].copy()
-                        save_df['비고'] = f"[{action}] {reason if reason.strip() else '상세내역 기록'}"
-                        save_df['지급일시'] = datetime.now()
-                        # DB에 저장 시 컬럼 순서 일치시키기
-                        save_df.to_sql(name='mileage_records', con=engine, if_exists='append', index=False)
-                        st.success("🎉 DB 저장 완료!")
+                        st.session_state['db_confirm_step'] = True
+                    
+                    if st.session_state.get('db_confirm_step'):
+                        st.warning("❓ 상세 내역을 DB에 저장하시겠습니까?")
+                        cc1, cc2 = st.columns(2)
+                        if cc1.button("⭕ 예 (저장)", use_container_width=True):
+                            save_df = st.session_state['cleaned_df'].copy()
+                            save_df['비고'] = f"[{action}] {reason if reason.strip() else '상세내역 기록'}"
+                            save_df['지급일시'] = datetime.now()
+                            save_df.to_sql(name='mileage_records', con=engine, if_exists='append', index=False)
+                            st.success("🎉 DB 저장 완료!")
+                            st.session_state['db_confirm_step'] = False
+                        if cc2.button("❌ 아니요 (취소)", use_container_width=True):
+                            st.session_state['db_confirm_step'] = False
+                            st.rerun()
 
                 with b2:
                     if st.button(f"🚀 2. 카페24로 {action} 실행", use_container_width=True, type="primary"):
@@ -183,7 +188,7 @@ if menu == "적립금 지급하기":
         except Exception as e: st.error(f"오류: {e}")
 
 # ==========================================
-# 화면 2: 기록 조회 및 다운로드
+# 화면 2: 기록 조회 및 다운로드 (기존 유지)
 # ==========================================
 elif menu == "기록 조회 및 다운로드":
     st.title("🔍 DB 기록 조회 및 다운로드")
@@ -203,7 +208,7 @@ elif menu == "기록 조회 및 다운로드":
     except: st.info("기록이 없습니다.")
 
 # ==========================================
-# 화면 3: DB 기록 삭제
+# 화면 3: DB 기록 삭제 (기존 유지)
 # ==========================================
 elif menu == "DB 기록 삭제":
     st.title("🗑️ DB 기록 삭제 (묶음별)")

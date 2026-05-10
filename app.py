@@ -3,7 +3,6 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 import requests
 import base64
-import time
 import urllib.parse
 import io
 from datetime import datetime
@@ -11,43 +10,67 @@ from datetime import datetime
 # --- [페이지 설정] ---
 st.set_page_config(page_title="카페24 적립금 통합 관리 시스템", layout="wide")
 
+# ==========================================
+# [신규 추가] DB 연결 상태 관리 및 토글 버튼
+# ==========================================
+if 'db_connected' not in st.session_state:
+    # 앱을 처음 켰을 때는 DB 에러 방지를 위해 무조건 '연결 해제' 상태로 시작합니다.
+    st.session_state['db_connected'] = False 
+
+st.sidebar.title("🔌 시스템 모드")
+if st.session_state['db_connected']:
+    st.sidebar.success("🟢 DB 연결 모드 (기록 저장 및 조회 가능)")
+    if st.sidebar.button("DB 연결 끊기 (API 전용)", use_container_width=True):
+        st.session_state['db_connected'] = False
+        st.rerun()
+else:
+    st.sidebar.warning("🟡 DB 연결 해제 모드 (적립금 지급만 가능)")
+    if st.sidebar.button("DB 연결 시도하기", use_container_width=True, type="primary"):
+        st.session_state['db_connected'] = True
+        st.rerun()
+
+st.sidebar.divider()
+
 # --- [DB 연결 및 초기화] ---
 @st.cache_resource
 def init_connection():
     db_info = st.secrets["mysql"]
     return create_engine(f"mysql+pymysql://{db_info['user']}:{db_info['password']}@{db_info['host']}:{db_info['port']}/{db_info['database']}?charset=utf8mb4")
 
-engine = init_connection()
-
-def prepare_db():
-    with engine.connect() as conn:
-        # 1. 테이블 생성 (주문일 포함)
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS mileage_records (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                아이디 VARCHAR(255),
-                주문자명 VARCHAR(255),
-                고객명 VARCHAR(255),
-                브랜드 VARCHAR(255),
-                상품 TEXT,
-                색상 VARCHAR(100),
-                사이즈 VARCHAR(100),
-                주문일 VARCHAR(100),
-                금액 INT,
-                비고 TEXT,
-                지급일시 DATETIME DEFAULT CURRENT_TIMESTAMP
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-        """))
-        
-        # 2. 기존 테이블에 '주문일' 컬럼이 없는 경우 강제로 추가
-        try:
-            conn.execute(text("ALTER TABLE mileage_records ADD COLUMN 주문일 VARCHAR(100) AFTER 사이즈;"))
+engine = None
+if st.session_state['db_connected']:
+    try:
+        engine = init_connection()
+        with engine.connect() as conn:
+            # 1. 테이블 생성
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS mileage_records (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    아이디 VARCHAR(255),
+                    주문자명 VARCHAR(255),
+                    고객명 VARCHAR(255),
+                    브랜드 VARCHAR(255),
+                    상품 TEXT,
+                    색상 VARCHAR(100),
+                    사이즈 VARCHAR(100),
+                    주문일 VARCHAR(100),
+                    금액 INT,
+                    비고 TEXT,
+                    지급일시 DATETIME DEFAULT CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            """))
+            # 2. 기존 테이블에 '주문일' 컬럼이 없는 경우 강제로 추가
+            try:
+                conn.execute(text("ALTER TABLE mileage_records ADD COLUMN 주문일 VARCHAR(100) AFTER 사이즈;"))
+                conn.commit()
+            except:
+                pass
             conn.commit()
-        except:
-            pass
-        conn.commit()
+    except Exception as e:
+        st.sidebar.error("DB 접속에 실패했습니다. DB 연결을 해제합니다.")
+        st.session_state['db_connected'] = False
+        engine = None
 
-prepare_db()
 
 # --- [카페24 설정 정보] ---
 cafe24_info = st.secrets["cafe24"]
@@ -112,19 +135,22 @@ if menu == "적립금 지급하기":
             target_df['금액'] = pd.to_numeric(target_df['금액'], errors='coerce').fillna(0)
             target_df['주문일'] = target_df['주문일'].astype(str).str.strip()
 
-            try:
-                db_df = pd.read_sql(f"SELECT {', '.join(req_cols)}, 주문일, 금액 FROM mileage_records", con=engine)
-                existing_keys = set(db_df.astype(str).apply(lambda x: '|'.join(x.fillna('')), axis=1).tolist())
-            except:
-                existing_keys = set()
+            existing_keys = set()
+            # DB가 연결되어 있을 때만 중복 체크 실행
+            if st.session_state['db_connected'] and engine is not None:
+                try:
+                    db_df = pd.read_sql(f"SELECT {', '.join(req_cols)}, 주문일, 금액 FROM mileage_records", con=engine)
+                    existing_keys = set(db_df.astype(str).apply(lambda x: '|'.join(x.fillna('')), axis=1).tolist())
+                except:
+                    pass
             
             current_keys = target_df.astype(str).apply(lambda x: '|'.join(x.fillna('')), axis=1)
-            target_df['DB상태'] = current_keys.apply(lambda x: '🚨 중복' if x in existing_keys else '✅ 신규')
+            target_df['DB상태'] = current_keys.apply(lambda x: '🚨 중복' if x in existing_keys else '✅ 신규/DB없음')
             target_df.insert(0, '삭제선택', False)
             target_df.loc[target_df['DB상태'] == '🚨 중복', '삭제선택'] = True
             
             duplicate_only = target_df[target_df['DB상태'] == '🚨 중복'].drop(columns=['삭제선택'])
-            if not duplicate_only.empty:
+            if not duplicate_only.empty and st.session_state['db_connected']:
                 dup_out = io.BytesIO()
                 with pd.ExcelWriter(dup_out, engine='xlsxwriter') as writer:
                     duplicate_only.to_excel(writer, index=False)
@@ -151,23 +177,26 @@ if menu == "적립금 지급하기":
                 
                 b1, b2 = st.columns(2)
                 with b1:
-                    # 🚨 [컨펌 로직 복구]
-                    if st.button("💾 1. 원본 상세 내역을 DB에 기록", use_container_width=True, type="primary"):
-                        st.session_state['db_confirm_step'] = True
-                    
-                    if st.session_state.get('db_confirm_step'):
-                        st.warning("❓ 상세 내역을 DB에 저장하시겠습니까?")
-                        cc1, cc2 = st.columns(2)
-                        if cc1.button("⭕ 예 (저장)", use_container_width=True):
-                            save_df = st.session_state['cleaned_df'].copy()
-                            save_df['비고'] = f"[{action}] {reason if reason.strip() else '상세내역 기록'}"
-                            save_df['지급일시'] = datetime.now()
-                            save_df.to_sql(name='mileage_records', con=engine, if_exists='append', index=False)
-                            st.success("🎉 DB 저장 완료!")
-                            st.session_state['db_confirm_step'] = False
-                        if cc2.button("❌ 아니요 (취소)", use_container_width=True):
-                            st.session_state['db_confirm_step'] = False
-                            st.rerun()
+                    # DB가 연결된 상태에서만 DB 저장 버튼 표시
+                    if st.session_state['db_connected'] and engine is not None:
+                        if st.button("💾 1. 원본 상세 내역을 DB에 기록", use_container_width=True, type="secondary"):
+                            st.session_state['db_confirm_step'] = True
+                        
+                        if st.session_state.get('db_confirm_step'):
+                            st.warning("❓ 상세 내역을 DB에 저장하시겠습니까?")
+                            cc1, cc2 = st.columns(2)
+                            if cc1.button("⭕ 예 (저장)", use_container_width=True):
+                                save_df = st.session_state['cleaned_df'].copy()
+                                save_df['비고'] = f"[{action}] {reason if reason.strip() else '상세내역 기록'}"
+                                save_df['지급일시'] = datetime.now()
+                                save_df.to_sql(name='mileage_records', con=engine, if_exists='append', index=False)
+                                st.success("🎉 DB 저장 완료!")
+                                st.session_state['db_confirm_step'] = False
+                            if cc2.button("❌ 아니요 (취소)", use_container_width=True):
+                                st.session_state['db_confirm_step'] = False
+                                st.rerun()
+                    else:
+                        st.info("💡 DB 연결 해제 모드: 내역이 DB에 저장되지 않습니다.")
 
                 with b2:
                     if st.button(f"🚀 2. 카페24로 {action} 실행", use_container_width=True, type="primary"):
@@ -183,47 +212,49 @@ if menu == "적립금 지급하기":
                                 res = requests.post(url, json=payload, headers=headers)
                                 if res.status_code in [200, 201]: success += 1
                                 bar.progress((idx + 1) / len(s_df))
-                            st.success(f"🎉 {success}건 처리 완료!")
+                            st.success(f"🎉 카페24로 {success}건 적립금 처리 완료!")
                             del st.session_state["access_token"]
         except Exception as e: st.error(f"오류: {e}")
 
 # ==========================================
-# 화면 2: 기록 조회 및 다운로드 (기존 유지)
+# 화면 2 & 3: DB 관련 화면 (DB 없을 시 차단)
 # ==========================================
-elif menu == "기록 조회 및 다운로드":
-    st.title("🔍 DB 기록 조회 및 다운로드")
-    try:
-        raw_df = pd.read_sql("SELECT * FROM mileage_records ORDER BY 지급일시 DESC", con=engine)
-        c1, c2, c3 = st.columns(3)
-        sid, sname, srs = c1.text_input("아이디"), c2.text_input("이름"), c3.text_input("사유")
-        f_df = raw_df.copy()
-        if sid: f_df = f_df[f_df['아이디'].str.contains(sid, na=False)]
-        if sname: f_df = f_df[f_df['주문자명'].str.contains(sname, na=False)]
-        if srs: f_df = f_df[f_df['비고'].str.contains(srs, na=False)]
-        st.dataframe(f_df, use_container_width=True, hide_index=True)
-        if not f_df.empty:
-            out = io.BytesIO()
-            with pd.ExcelWriter(out, engine='xlsxwriter') as w: f_df.to_excel(w, index=False)
-            st.download_button(label="📥 결과 다운로드", data=out.getvalue(), file_name="history.xlsx")
-    except: st.info("기록이 없습니다.")
+elif menu in ["기록 조회 및 다운로드", "DB 기록 삭제"]:
+    if not st.session_state['db_connected'] or engine is None:
+        st.warning("⚠️ 이 기능은 DB에 연결된 상태에서만 사용할 수 있습니다. 좌측 사이드바에서 [DB 연결 시도하기]를 눌러주세요.")
+        st.stop()
 
-# ==========================================
-# 화면 3: DB 기록 삭제 (기존 유지)
-# ==========================================
-elif menu == "DB 기록 삭제":
-    st.title("🗑️ DB 기록 삭제 (묶음별)")
-    try:
-        q = "SELECT DATE(지급일시) as 날짜, 비고, COUNT(*) as 건수 FROM mileage_records GROUP BY DATE(지급일시), 비고 ORDER BY 날짜 DESC"
-        gs = pd.read_sql(q, con=engine)
-        if gs.empty: st.info("삭제할 데이터가 없습니다.")
-        else:
-            gs['opt'] = gs['날짜'].astype(str) + " | " + gs['비고'].astype(str) + " (" + gs['건수'].astype(str) + "건)"
-            sel = st.selectbox("삭제할 묶음 선택", gs['opt'].tolist())
-            s_date, s_reason = sel.split(" | ")[0], sel.split(" | ")[1].split(" (")[0]
-            if st.button("🧨 선택 데이터 삭제", type="primary"):
-                with engine.connect() as conn:
-                    conn.execute(text("DELETE FROM mileage_records WHERE DATE(지급일시) = :d AND 비고 = :r"), {"d": s_date, "r": s_reason})
-                    conn.commit()
-                st.success("✅ 삭제 완료!")
-                st.rerun()
-    except Exception as e: st.error(f"오류: {e}")
+    if menu == "기록 조회 및 다운로드":
+        st.title("🔍 DB 기록 조회 및 다운로드")
+        try:
+            raw_df = pd.read_sql("SELECT * FROM mileage_records ORDER BY 지급일시 DESC", con=engine)
+            c1, c2, c3 = st.columns(3)
+            sid, sname, srs = c1.text_input("아이디"), c2.text_input("이름"), c3.text_input("사유")
+            f_df = raw_df.copy()
+            if sid: f_df = f_df[f_df['아이디'].str.contains(sid, na=False)]
+            if sname: f_df = f_df[f_df['주문자명'].str.contains(sname, na=False)]
+            if srs: f_df = f_df[f_df['비고'].str.contains(srs, na=False)]
+            st.dataframe(f_df, use_container_width=True, hide_index=True)
+            if not f_df.empty:
+                out = io.BytesIO()
+                with pd.ExcelWriter(out, engine='xlsxwriter') as w: f_df.to_excel(w, index=False)
+                st.download_button(label="📥 결과 다운로드", data=out.getvalue(), file_name="history.xlsx")
+        except: st.info("기록이 없습니다.")
+
+    elif menu == "DB 기록 삭제":
+        st.title("🗑️ DB 기록 삭제 (묶음별)")
+        try:
+            q = "SELECT DATE(지급일시) as 날짜, 비고, COUNT(*) as 건수 FROM mileage_records GROUP BY DATE(지급일시), 비고 ORDER BY 날짜 DESC"
+            gs = pd.read_sql(q, con=engine)
+            if gs.empty: st.info("삭제할 데이터가 없습니다.")
+            else:
+                gs['opt'] = gs['날짜'].astype(str) + " | " + gs['비고'].astype(str) + " (" + gs['건수'].astype(str) + "건)"
+                sel = st.selectbox("삭제할 묶음 선택", gs['opt'].tolist())
+                s_date, s_reason = sel.split(" | ")[0], sel.split(" | ")[1].split(" (")[0]
+                if st.button("🧨 선택 데이터 삭제", type="primary"):
+                    with engine.connect() as conn:
+                        conn.execute(text("DELETE FROM mileage_records WHERE DATE(지급일시) = :d AND 비고 = :r"), {"d": s_date, "r": s_reason})
+                        conn.commit()
+                    st.success("✅ 삭제 완료!")
+                    st.rerun()
+        except Exception as e: st.error(f"오류: {e}")

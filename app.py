@@ -214,7 +214,7 @@ if menu == "적립금 지급하기":
                                 if res.status_code in [200, 201]: success += 1
                                 bar.progress((idx + 1) / len(s_df))
                             st.success(f"🎉 카페24로 {success}건 적립금 처리 완료!")
-                            del st.session_state["access_token"]
+                           
         except Exception as e: st.error(f"오류: {e}")
 
 # ==========================================

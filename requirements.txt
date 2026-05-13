@@ -5,3 +5,4 @@ pymysql
 requests
 openpyxl
 xlsxwriter
+cryptography

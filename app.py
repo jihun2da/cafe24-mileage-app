@@ -67,7 +67,8 @@ if st.session_state['db_connected']:
                 pass
             conn.commit()
     except Exception as e:
-        st.sidebar.error("DB 접속에 실패했습니다. DB 연결을 해제합니다.")
+        # 🚨 [수정된 부분] 뭉뚱그려진 에러 대신, 컴퓨터가 뱉는 '진짜 에러 메시지'를 출력하도록 변경했습니다.
+        st.sidebar.error(f"🚨 상세 에러: {e}")
         st.session_state['db_connected'] = False
         engine = None
 

@@ -245,17 +245,56 @@ elif menu in ["기록 조회 및 다운로드", "DB 기록 삭제"]:
     elif menu == "DB 기록 삭제":
         st.title("🗑️ DB 기록 삭제 (묶음별)")
         try:
-            q = "SELECT DATE(지급일시) as 날짜, 비고, COUNT(*) as 건수 FROM mileage_records GROUP BY DATE(지급일시), 비고 ORDER BY 날짜 DESC"
+            q = """
+                SELECT DATE(지급일시) AS 날짜, 비고, COUNT(*) AS 건수
+                FROM mileage_records
+                GROUP BY DATE(지급일시), 비고
+                ORDER BY 날짜 DESC
+            """
             gs = pd.read_sql(q, con=engine)
-            if gs.empty: st.info("삭제할 데이터가 없습니다.")
+            if gs.empty:
+                st.info("삭제할 데이터가 없습니다.")
             else:
-                gs['opt'] = gs['날짜'].astype(str) + " | " + gs['비고'].astype(str) + " (" + gs['건수'].astype(str) + "건)"
-                sel = st.selectbox("삭제할 묶음 선택", gs['opt'].tolist())
-                s_date, s_reason = sel.split(" | ")[0], sel.split(" | ")[1].split(" (")[0]
+                gs = gs.reset_index(drop=True)
+                gs["날짜_str"] = pd.to_datetime(gs["날짜"]).dt.strftime("%Y-%m-%d")
+                gs["opt"] = (
+                    gs["날짜_str"]
+                    + " | "
+                    + gs["비고"].astype(str)
+                    + " ("
+                    + gs["건수"].astype(str)
+                    + "건)"
+                )
+
+                selected_idx = st.selectbox(
+                    "삭제할 묶음 선택",
+                    options=range(len(gs)),
+                    format_func=lambda i: gs.loc[i, "opt"],
+                )
+                row = gs.loc[selected_idx]
+                s_date = row["날짜_str"]
+                s_reason = str(row["비고"])
+
+                st.caption(f"선택 확인 → 날짜: {s_date} | 비고: {s_reason} | {row['건수']}건")
+
                 if st.button("🧨 선택 데이터 삭제", type="primary"):
-                    with engine.connect() as conn:
-                        conn.execute(text("DELETE FROM mileage_records WHERE DATE(지급일시) = :d AND 비고 = :r"), {"d": s_date, "r": s_reason})
-                        conn.commit()
-                    st.success("✅ 삭제 완료!")
-                    st.rerun()
-        except Exception as e: st.error(f"오류: {e}")
+                    with engine.begin() as conn:
+                        result = conn.execute(
+                            text(
+                                "DELETE FROM mileage_records "
+                                "WHERE DATE(지급일시) = :d AND 비고 = :r"
+                            ),
+                            {"d": s_date, "r": s_reason},
+                        )
+                        deleted = result.rowcount
+
+                    if deleted > 0:
+                        st.success(f"✅ {deleted}건 삭제 완료!")
+                        st.rerun()
+                    else:
+                        st.error(
+                            "❌ 삭제된 데이터가 없습니다. "
+                            "날짜/비고 조건이 일치하지 않습니다."
+                        )
+        except Exception as e:
+            st.error(f"오류: {e}")

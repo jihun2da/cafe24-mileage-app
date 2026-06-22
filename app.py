@@ -245,6 +245,10 @@ elif menu in ["기록 조회 및 다운로드", "DB 기록 삭제"]:
     elif menu == "DB 기록 삭제":
         st.title("🗑️ DB 기록 삭제 (묶음별)")
         try:
+            total_count = int(
+                pd.read_sql("SELECT COUNT(*) AS cnt FROM mileage_records", con=engine).iloc[0]["cnt"]
+            )
+
             q = """
                 SELECT DATE(지급일시) AS 날짜, 비고, COUNT(*) AS 건수
                 FROM mileage_records
@@ -252,6 +256,11 @@ elif menu in ["기록 조회 및 다운로드", "DB 기록 삭제"]:
                 ORDER BY 날짜 DESC
             """
             gs = pd.read_sql(q, con=engine)
+
+            m1, m2 = st.columns(2)
+            m1.metric("📊 DB 전체 건수", f"{total_count:,}건")
+            m2.metric("📦 삭제 묶음 수", f"{len(gs):,}개")
+
             if gs.empty:
                 st.info("삭제할 데이터가 없습니다.")
             else:

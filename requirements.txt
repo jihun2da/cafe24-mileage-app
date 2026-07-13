@@ -6,4 +6,3 @@ requests
 openpyxl
 xlsxwriter
 cryptography
-python-3.11.10

@@ -412,18 +412,63 @@ if menu == "적립금 지급하기":
                     st.error("⚠️ 유효한 금액이 있는 행이 없습니다.")
                     st.stop()
 
+                # --- 중복 체크 (DB 연결 시, 아이디+날짜+금액+구분 기준) ---
+                # 비고에 "[적립]", "[차감]", 혹은 상세양식의 "[적립금 추가 (지급)]" 등이 남아있으므로
+                # 문자열에 '적립'/'차감'이 포함되는지로 구분을 역추정해 두 양식 간에도 중복을 잡아낸다.
+                existing_keys = set()
+                if st.session_state['db_connected'] and engine is not None:
+                    try:
+                        db_df = pd.read_sql("SELECT 아이디, 주문일, 금액, 비고 FROM mileage_records", con=engine)
+                        db_df['아이디'] = db_df['아이디'].astype(str).str.strip()
+                        db_df['주문일'] = db_df['주문일'].astype(str).str.strip()
+                        db_df['금액'] = pd.to_numeric(db_df['금액'], errors='coerce').fillna(0).astype(int)
+
+                        def _extract_action(remark):
+                            # 주의: "적립금 차감 (회수)"처럼 '차감' 문구 안에도 '적립'이라는 글자가
+                            # 포함되어 있으므로(적립금), 반드시 '차감'을 먼저 검사해야 한다.
+                            s = str(remark)
+                            if '차감' in s:
+                                return '차감'
+                            if '적립' in s:
+                                return '적립'
+                            return ''
+
+                        db_df['구분_추정'] = db_df['비고'].apply(_extract_action)
+                        existing_keys = set(
+                            (db_df['아이디'] + '|' + db_df['주문일'] + '|' + db_df['금액'].astype(str) + '|' + db_df['구분_추정']).tolist()
+                        )
+                    except Exception as e:
+                        st.warning(f"⚠️ 중복 체크용 DB 조회에 실패했습니다. 중복 체크 없이 진행합니다. (사유: {e})")
+
+                current_keys = (
+                    grouped['아이디'].astype(str).str.strip() + '|' +
+                    grouped['날짜'].astype(str).str.strip() + '|' +
+                    grouped['금액'].astype(int).astype(str) + '|' +
+                    grouped['구분'].astype(str)
+                )
+                grouped['DB상태'] = current_keys.apply(lambda x: '🚨 중복' if x in existing_keys else '✅ 신규/DB없음')
                 grouped.insert(0, '실행선택', True)
+                grouped.loc[grouped['DB상태'] == '🚨 중복', '실행선택'] = False
+
+                duplicate_only = grouped[grouped['DB상태'] == '🚨 중복'].drop(columns=['실행선택'])
+                if not duplicate_only.empty and st.session_state['db_connected']:
+                    st.download_button(
+                        label=f"📥 중복 데이터 다운로드 ({len(duplicate_only)}건)",
+                        data=make_excel_bytes(duplicate_only),
+                        file_name="간편양식_duplicates.xlsx",
+                    )
 
                 st.divider()
-                c1, c2, c3 = st.columns(3)
+                c1, c2, c3, c4 = st.columns(4)
                 c1.metric("총 건수", f"{len(grouped)} 건")
                 c2.metric("적립 합계", f"{grouped.loc[grouped['구분']=='적립','금액'].sum():,.0f} 원")
                 c3.metric("차감 합계", f"{grouped.loc[grouped['구분']=='차감','금액'].sum():,.0f} 원")
+                c4.metric("🚨 중복 건수", f"{len(duplicate_only)} 건")
 
                 edited = st.data_editor(grouped, hide_index=True, use_container_width=True, key="simple_editor")
                 common_reason = st.text_input("📝 공통 사유 (엑셀에 개별 사유가 없는 행에 사용됩니다)", key="simple_common_reason")
 
-                run_df = edited[edited['실행선택'] == True].drop(columns=['실행선택'])
+                run_df = edited[edited['실행선택'] == True].drop(columns=['실행선택', 'DB상태'])
                 st.caption(f"실행 대상: {len(run_df)}건")
 
                 b1, b2 = st.columns(2)

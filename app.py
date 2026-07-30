@@ -216,8 +216,9 @@ def _store_token(access_token, refresh_token):
                     VALUES (1, :a, :r, :t)
                     ON DUPLICATE KEY UPDATE access_token=:a, refresh_token=:r, issued_at=:t
                 """), {"a": access_token, "r": refresh_token, "t": now})
-        except Exception:
-            pass  # 영속화 실패해도 현재 세션 동작에는 지장 없음
+        except Exception as persist_err:
+            # 영속화 실패해도 현재 세션 동작은 막지 않되, 원인 파악을 위해 에러는 노출합니다.
+            st.sidebar.warning(f"⚠️ 토큰 DB 저장 실패 (현재 세션은 정상 동작): {persist_err}")
 
 
 def _load_token_from_db():
@@ -230,8 +231,8 @@ def _load_token_from_db():
             )).fetchone()
         if row and row.access_token:
             return row.access_token, row.refresh_token, row.issued_at
-    except Exception:
-        pass
+    except Exception as load_err:
+        st.sidebar.warning(f"⚠️ 토큰 DB 조회 실패 (재로그인이 필요할 수 있습니다): {load_err}")
     return None
 
 

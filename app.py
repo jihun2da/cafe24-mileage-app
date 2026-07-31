@@ -219,7 +219,16 @@ if menu == "적립금 지급하기":
             f"https://{MALL_ID}.cafe24api.com/api/v2/oauth/authorize?response_type=code"
             f"&client_id={CLIENT_ID}&state=random&redirect_uri={urllib.parse.quote(REDIRECT_URI)}&scope={SCOPE}"
         )
-        st.link_button("🔐 카페24 로그인 및 연동하기", auth_url, type="primary")
+        # st.link_button은 항상 새 창(target=_blank)으로 열려 불필요한 창이 하나 더 뜨는 문제가 있어,
+        # target=_self 앵커로 대체해 현재 탭에서 그대로 카페24 로그인 페이지로 이동하도록 처리합니다.
+        # (다른 수정사항은 전부 제외하고 이 변경 하나만 적용한 격리 테스트 버전입니다)
+        st.markdown(
+            f'<a href="{auth_url}" target="_self" '
+            f'style="display:inline-block;padding:0.6em 1.2em;background-color:#FF4B4B;'
+            f'color:white;border-radius:0.5em;text-decoration:none;font-weight:600;">'
+            f'🔐 카페24 로그인 및 연동하기</a>',
+            unsafe_allow_html=True,
+        )
         st.stop()
     else:
         st.success(f"✅ {MALL_ID} 연결 성공!")

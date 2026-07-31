@@ -5,13 +5,40 @@ import requests
 import base64
 import urllib.parse
 import io
+import hmac
+import hashlib
+import time
 from datetime import datetime
 
 # --- [페이지 설정] ---
 st.set_page_config(page_title="카페24 적립금 통합 관리 시스템", layout="wide")
 
 # ==========================================
-# DB 연결 상태 관리 및 토글 버튼
+# [공용 유틸] 금액 정규화 / 중복 방지 키 생성
+#  - DB에는 금액을 INT로 저장하지만, 업로드 엑셀은 pandas가 float으로 읽는 경우가 많아
+#    문자열로 이어붙여 중복 키를 만들면 "1000" vs "1000.0" 처럼 서로 달라져
+#    실제 중복인데도 신규로 오인식하는 문제가 있었습니다.
+#  -> 저장 시점에 정규화된 dedup_key 컬럼을 DB에 함께 저장해두고,
+#     조회 시에는 그 값을 그대로 비교합니다.
+# ==========================================
+DEDUP_COLS = ['아이디', '주문자명', '고객명', '브랜드', '상품', '색상', '사이즈', '주문일']
+
+
+def normalize_amount(x):
+    try:
+        return int(round(float(x)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def make_dedup_key(row):
+    parts = [str(row.get(c, '') or '').strip() for c in DEDUP_COLS]
+    parts.append(str(normalize_amount(row.get('금액', 0))))
+    return '|'.join(parts)
+
+
+# ==========================================
+# [신규 추가] DB 연결 상태 관리 및 토글 버튼
 # ==========================================
 if 'db_connected' not in st.session_state:
     # 앱을 처음 켰을 때는 DB 에러 방지를 위해 무조건 '연결 해제' 상태로 시작합니다.
@@ -22,6 +49,7 @@ if st.session_state['db_connected']:
     st.sidebar.success("🟢 DB 연결 모드 (기록 저장 및 조회 가능)")
     if st.sidebar.button("DB 연결 끊기 (API 전용)", use_container_width=True):
         st.session_state['db_connected'] = False
+        st.session_state.pop('db_migrated', None)
         st.rerun()
 else:
     st.sidebar.warning("🟡 DB 연결 해제 모드 (적립금 지급만 가능)")
@@ -31,61 +59,101 @@ else:
 
 st.sidebar.divider()
 
+
 # --- [DB 연결 및 초기화] ---
 @st.cache_resource
 def init_connection():
     db_info = st.secrets["mysql"]
     return create_engine(
-        f"mysql+pymysql://{db_info['user']}:{db_info['password']}@{db_info['host']}:{db_info['port']}/{db_info['database']}?charset=utf8mb4"
+        f"mysql+pymysql://{db_info['user']}:{db_info['password']}@{db_info['host']}:{db_info['port']}/{db_info['database']}?charset=utf8mb4",
+        pool_pre_ping=True,
     )
 
-REQUIRED_COLS = ['아이디', '주문자명', '고객명', '브랜드', '상품', '색상', '사이즈']
+
+def _column_exists(conn, table, column):
+    row = conn.execute(text("""
+        SELECT COUNT(*) AS cnt FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t AND COLUMN_NAME = :c
+    """), {"t": table, "c": column}).fetchone()
+    return row.cnt > 0
+
+
+def _index_exists(conn, table, index_name):
+    row = conn.execute(text("""
+        SELECT COUNT(*) AS cnt FROM information_schema.STATISTICS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :t AND INDEX_NAME = :i
+    """), {"t": table, "i": index_name}).fetchone()
+    return row.cnt > 0
+
 
 engine = None
 if st.session_state['db_connected']:
-    # 1) 연결 + 테이블 생성 (실패하면 DB 모드 자체를 해제)
     try:
         engine = init_connection()
-        with engine.connect() as conn:
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS mileage_records (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    아이디 VARCHAR(255),
-                    주문자명 VARCHAR(255),
-                    고객명 VARCHAR(255),
-                    브랜드 VARCHAR(255),
-                    상품 TEXT,
-                    색상 VARCHAR(100),
-                    사이즈 VARCHAR(100),
-                    주문일 VARCHAR(100),
-                    금액 INT,
-                    비고 TEXT,
-                    지급일시 DATETIME DEFAULT CURRENT_TIMESTAMP
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-            """))
-            conn.commit()
-    except Exception as e:
-        # 🚨 뭉뚱그려진 에러 대신 실제 에러 메시지를 노출합니다.
-        st.sidebar.error(f"🚨 DB 연결 실패: {e}")
-        st.session_state['db_connected'] = False
-        engine = None
-
-    # 2) '주문일' 컬럼 존재 여부를 information_schema로 정확히 확인 후에만 ALTER
-    #    (기존에는 무조건 ALTER 시도 + 무조건 예외 무시라서 진짜 에러도 함께 숨겨졌습니다)
-    if engine is not None:
-        try:
-            with engine.connect() as conn:
-                col_exists = conn.execute(text("""
-                    SELECT COUNT(*) FROM information_schema.COLUMNS
-                    WHERE TABLE_SCHEMA = DATABASE()
-                      AND TABLE_NAME = 'mileage_records'
-                      AND COLUMN_NAME = '주문일'
-                """)).scalar()
-                if not col_exists:
+        # 마이그레이션/점검 로직은 세션당 1회만 실행 (매 rerun마다 반복 실행되는 것을 방지)
+        if not st.session_state.get('db_migrated'):
+            with engine.begin() as conn:
+                # 1. 테이블 생성
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS mileage_records (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        아이디 VARCHAR(255),
+                        주문자명 VARCHAR(255),
+                        고객명 VARCHAR(255),
+                        브랜드 VARCHAR(255),
+                        상품 TEXT,
+                        색상 VARCHAR(100),
+                        사이즈 VARCHAR(100),
+                        주문일 VARCHAR(100),
+                        금액 INT,
+                        비고 TEXT,
+                        지급일시 DATETIME DEFAULT CURRENT_TIMESTAMP
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                """))
+                # 2. 기존 테이블에 '주문일' 컬럼이 없는 경우 추가
+                if not _column_exists(conn, "mileage_records", "주문일"):
                     conn.execute(text("ALTER TABLE mileage_records ADD COLUMN 주문일 VARCHAR(100) AFTER 사이즈;"))
-                    conn.commit()
-        except Exception as e:
-            st.sidebar.warning(f"⚠️ 테이블 컬럼 점검 중 문제 발생 (기능에는 영향 없을 수 있음): {e}")
+                # 3. 중복 방지용 dedup_key 컬럼이 없는 경우 추가
+                if not _column_exists(conn, "mileage_records", "dedup_key"):
+                    conn.execute(text("ALTER TABLE mileage_records ADD COLUMN dedup_key VARCHAR(600);"))
+
+                # 4. 기존 데이터 중 dedup_key가 비어있는 행을 채워넣기 (최초 1회성 마이그레이션)
+                null_rows = conn.execute(text(
+                    "SELECT id, 아이디, 주문자명, 고객명, 브랜드, 상품, 색상, 사이즈, 주문일, 금액 "
+                    "FROM mileage_records WHERE dedup_key IS NULL OR dedup_key = ''"
+                )).fetchall()
+                for r in null_rows:
+                    k = make_dedup_key({
+                        '아이디': r.아이디, '주문자명': r.주문자명, '고객명': r.고객명, '브랜드': r.브랜드,
+                        '상품': r.상품, '색상': r.색상, '사이즈': r.사이즈, '주문일': r.주문일, '금액': r.금액,
+                    })
+                    conn.execute(text("UPDATE mileage_records SET dedup_key=:k WHERE id=:id"), {"k": k, "id": r.id})
+
+                # 5. 중복 방지용 유니크 인덱스 (기존 데이터에 중복이 있으면 생성이 실패할 수 있어 별도 처리)
+                if not _index_exists(conn, "mileage_records", "uq_dedup_key"):
+                    try:
+                        conn.execute(text(
+                            "ALTER TABLE mileage_records ADD UNIQUE INDEX uq_dedup_key (dedup_key);"
+                        ))
+                    except Exception as idx_err:
+                        st.sidebar.info(f"ℹ️ 중복 방지 인덱스는 생성하지 못했습니다 (기존 데이터에 중복 가능성): {idx_err}")
+
+                # 6. 카페24 OAuth 토큰 영속화 테이블 (2시간마다 만료되는 access_token 자동 갱신용)
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS cafe24_oauth_token (
+                        id INT PRIMARY KEY,
+                        access_token TEXT,
+                        refresh_token TEXT,
+                        issued_at DATETIME
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                """))
+            st.session_state['db_migrated'] = True
+    except Exception as e:
+        # 뭉뚱그려진 에러 대신, 실제 에러 메시지를 출력
+        st.sidebar.error(f"🚨 상세 에러: {e}")
+        st.session_state['db_connected'] = False
+        st.session_state.pop('db_migrated', None)
+        engine = None
 
 
 # --- [카페24 설정 정보] ---
@@ -96,103 +164,140 @@ CLIENT_SECRET = cafe24_info["client_secret"]
 REDIRECT_URI = "https://cafe24-mileage-app.streamlit.app"
 SCOPE = "mall.read_customer,mall.write_customer,mall.read_mileage,mall.write_mileage"
 
+# access_token 수명(분). 카페24 access_token은 발급 후 약 2시간(120분) 뒤 만료되므로
+# 여유를 두고 110분이 지나면 만료 전에 미리 자동 갱신합니다.
+TOKEN_LIFETIME_MIN = 110
+
+
+def _basic_auth_header():
+    auth_str = f"{CLIENT_ID}:{CLIENT_SECRET}"
+    b64_auth = base64.b64encode(auth_str.encode('utf-8')).decode('utf-8')
+    return {"Authorization": f"Basic {b64_auth}", "Content-Type": "application/x-www-form-urlencoded"}
+
 
 def get_access_token(auth_code):
     url = f"https://{MALL_ID}.cafe24api.com/api/v2/oauth/token"
-    auth_str = f"{CLIENT_ID}:{CLIENT_SECRET}"
-    b64_auth = base64.b64encode(auth_str.encode('utf-8')).decode('utf-8')
-    headers = {"Authorization": f"Basic {b64_auth}", "Content-Type": "application/x-www-form-urlencoded"}
+    headers = _basic_auth_header()
     data = {"grant_type": "authorization_code", "code": auth_code, "redirect_uri": REDIRECT_URI}
     try:
         response = requests.post(url, headers=headers, data=data, timeout=15)
-    except Exception as e:
-        return None, f"요청 실패: {e}"
+    except requests.RequestException as e:
+        return None, None, str(e)
     if response.status_code == 200:
-        return response.json().get("access_token"), None
-    return None, response.text
+        j = response.json()
+        return j.get("access_token"), j.get("refresh_token"), None
+    return None, None, response.text
 
 
-def send_points(access_token, member_id, amount, action_label, reason):
-    """카페24 적립금 지급/차감 API 호출. (성공여부, 에러메시지) 반환."""
-    url = f"https://{MALL_ID}.cafe24api.com/api/v2/admin/points"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-        "X-Cafe24-Api-Version": "2026-03-01",
-    }
-    api_type = "increase" if "적립" in action_label or "추가" in action_label else "decrease"
-    payload = {"request": {
-        "member_id": str(member_id).strip(),
-        "amount": abs(int(amount)),
-        "type": api_type,
-        "reason": reason if reason and str(reason).strip() else "적립금 처리",
-    }}
+def refresh_access_token(refresh_token):
+    url = f"https://{MALL_ID}.cafe24api.com/api/v2/oauth/token"
+    headers = _basic_auth_header()
+    data = {"grant_type": "refresh_token", "refresh_token": refresh_token}
     try:
-        res = requests.post(url, json=payload, headers=headers, timeout=15)
-    except Exception as e:
-        return False, f"요청 실패: {e}"
-    if res.status_code in (200, 201):
-        return True, None
-    return False, res.text[:300]
+        response = requests.post(url, headers=headers, data=data, timeout=15)
+    except requests.RequestException as e:
+        return None, None, str(e)
+    if response.status_code == 200:
+        j = response.json()
+        return j.get("access_token"), j.get("refresh_token"), None
+    return None, None, response.text
 
 
-def make_excel_bytes(df: pd.DataFrame) -> bytes:
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine='xlsxwriter') as writer:
-        df.to_excel(writer, index=False)
-    return out.getvalue()
+def _store_token(access_token, refresh_token):
+    """세션에 토큰을 저장하고, DB가 연결되어 있으면 영속화하여
+    앱이 재시작되거나 세션이 끊겨도 refresh_token으로 자동 갱신할 수 있게 합니다."""
+    now = datetime.now()
+    st.session_state['access_token'] = access_token
+    st.session_state['refresh_token'] = refresh_token
+    st.session_state['token_issued_at'] = now
+    if st.session_state.get('db_connected') and engine is not None:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text("""
+                    INSERT INTO cafe24_oauth_token (id, access_token, refresh_token, issued_at)
+                    VALUES (1, :a, :r, :t)
+                    ON DUPLICATE KEY UPDATE access_token=:a, refresh_token=:r, issued_at=:t
+                """), {"a": access_token, "r": refresh_token, "t": now})
+        except Exception as persist_err:
+            # 영속화 실패해도 현재 세션 동작은 막지 않되, 원인 파악을 위해 에러는 노출합니다.
+            st.sidebar.warning(f"⚠️ 토큰 DB 저장 실패 (현재 세션은 정상 동작): {persist_err}")
 
 
-def reset_state_if_new_file(uploaded_file, key_prefix):
-    """새 파일이 업로드되면 이전 파일로 만들어진 세션 상태(합산표, 확인단계 등)를 정리해
-    서로 다른 파일의 상태가 섞이는 것을 방지합니다."""
-    sig_key = f"{key_prefix}_file_sig"
-    file_sig = f"{uploaded_file.name}_{uploaded_file.size}" if uploaded_file is not None else None
-    if file_sig != st.session_state.get(sig_key):
-        for k in list(st.session_state.keys()):
-            if k.startswith(key_prefix) and k != sig_key:
-                del st.session_state[k]
-        st.session_state[sig_key] = file_sig
-
-
-def load_simple_format(file):
-    """간편 양식(아이디+금액, 시트명 적립/차감) 엑셀을 읽어 표준 DataFrame으로 변환합니다."""
-    xls = pd.ExcelFile(file)
-    frames = []
-    for sheet in xls.sheet_names:
-        sdf = xls.parse(sheet)
-        sdf.columns = sdf.columns.astype(str).str.strip()
-        if '아이디' not in sdf.columns:
-            continue
-        amt_col = '금액' if '금액' in sdf.columns else next((c for c in sdf.columns if '금액' in c), None)
-        if amt_col is None:
-            continue
-        name_col = next((c for c in sdf.columns if c in ['주문자명', '고객명', '이름']), None)
-        reason_col = next((c for c in sdf.columns if ('내용' in c) or ('비고' in c) or ('사유' in c)), None)
-        date_col = next((c for c in sdf.columns if ('날짜' in c) or ('주문일' in c)), None)
-
-        if '차감' in sheet:
-            action = '차감'
-        elif '적립' in sheet:
-            action = '적립'
-        else:
-            action = None  # 사용자에게 별도 확인
-
-        tmp = pd.DataFrame()
-        tmp['아이디'] = sdf['아이디'].astype(str).str.strip()
-        tmp['주문자명'] = sdf[name_col].astype(str).str.strip() if name_col else ''
-        tmp['금액'] = pd.to_numeric(sdf[amt_col], errors='coerce').fillna(0).astype(int)
-        tmp['사유'] = sdf[reason_col].astype(str).str.strip().replace('nan', '') if reason_col else ''
-        tmp['날짜'] = sdf[date_col].astype(str).str.strip() if date_col else ''
-        tmp['구분'] = action
-        tmp['시트명'] = sheet
-
-        tmp = tmp[(tmp['아이디'].notna()) & (tmp['아이디'] != '') & (tmp['아이디'].str.lower() != 'nan')]
-        frames.append(tmp)
-
-    if not frames:
+def _load_token_from_db():
+    if not (st.session_state.get('db_connected') and engine is not None):
         return None
-    return pd.concat(frames, ignore_index=True)
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT access_token, refresh_token, issued_at FROM cafe24_oauth_token WHERE id=1"
+            )).fetchone()
+        if row and row.access_token:
+            return row.access_token, row.refresh_token, row.issued_at
+    except Exception as load_err:
+        st.sidebar.warning(f"⚠️ 토큰 DB 조회 실패 (재로그인이 필요할 수 있습니다): {load_err}")
+    return None
+
+
+def ensure_valid_token():
+    """항상 유효한 access_token을 보장합니다.
+    세션에 토큰이 없으면 DB에서 복구를 시도하고, 만료가 임박했으면 refresh_token으로 자동 갱신합니다."""
+    if 'access_token' not in st.session_state:
+        loaded = _load_token_from_db()
+        if loaded:
+            st.session_state['access_token'], st.session_state['refresh_token'], st.session_state['token_issued_at'] = loaded
+        else:
+            return False
+
+    issued_at = st.session_state.get('token_issued_at')
+    needs_refresh = True
+    if issued_at:
+        elapsed_min = (datetime.now() - issued_at).total_seconds() / 60
+        needs_refresh = elapsed_min >= TOKEN_LIFETIME_MIN
+
+    if needs_refresh and st.session_state.get('refresh_token'):
+        new_access, new_refresh, err = refresh_access_token(st.session_state['refresh_token'])
+        if new_access:
+            _store_token(new_access, new_refresh or st.session_state['refresh_token'])
+        else:
+            st.session_state.pop('access_token', None)
+            st.session_state.pop('refresh_token', None)
+            st.session_state.pop('token_issued_at', None)
+            st.warning(f"⚠️ 인증 토큰 자동 갱신에 실패했습니다. 다시 로그인해주세요. ({err})")
+            return False
+
+    return 'access_token' in st.session_state
+
+
+# ==========================================
+# [수정] OAuth state(CSRF 방지) 값을 세션 상태에 의존하지 않고 생성/검증합니다.
+#  - 카페24 로그인 페이지로 이동했다가 redirect_uri로 되돌아오는 과정은
+#    브라우저의 완전한 풀 리로드(새 페이지 로드)이기 때문에, 그 사이에
+#    Streamlit의 st.session_state는 통째로 초기화됩니다.
+#  - 따라서 로그인 이전에 session_state에 저장해둔 state 값과, 로그인 후 돌아왔을 때의
+#    session_state를 비교하는 방식은 항상 실패해서 "인증 상태값이 일치하지 않습니다"
+#    에러가 반복되고, 로그인 화면을 절대 벗어나지 못하는 무한 루프에 빠지는 버그가 있었습니다.
+#  - 세션 없이도 검증 가능하도록 타임스탬프 + HMAC 서명 조합의 stateless state 값을 사용합니다.
+# ==========================================
+OAUTH_STATE_MAX_AGE_SEC = 600  # state 값 유효 시간(초). 이 시간 내에 로그인을 완료해야 합니다.
+
+
+def _make_oauth_state():
+    ts = str(int(time.time()))
+    sig = hmac.new(CLIENT_SECRET.encode('utf-8'), ts.encode('utf-8'), hashlib.sha256).hexdigest()
+    return f"{ts}.{sig}"
+
+
+def _verify_oauth_state(state_value):
+    if not state_value or "." not in state_value:
+        return False
+    ts_str, sig = state_value.split(".", 1)
+    expected_sig = hmac.new(CLIENT_SECRET.encode('utf-8'), ts_str.encode('utf-8'), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected_sig):
+        return False
+    try:
+        return (time.time() - int(ts_str)) <= OAUTH_STATE_MAX_AGE_SEC
+    except ValueError:
+        return False
 
 
 # --- [사이드바 메뉴] ---
@@ -206,361 +311,200 @@ if menu == "적립금 지급하기":
     st.title("💰 적립금 자동 지급/차감 시스템")
 
     if "code" in st.query_params and "access_token" not in st.session_state:
-        token, error_msg = get_access_token(st.query_params["code"])
-        if token:
-            st.session_state["access_token"] = token
+        returned_state = st.query_params.get("state")
+        if not _verify_oauth_state(returned_state):
+            st.error("🚨 인증 요청이 만료되었거나 위조되었을 수 있습니다. 아래 버튼으로 다시 로그인해주세요.")
             st.query_params.clear()
-            st.rerun()
         else:
-            st.error(f"🚨 카페24 인증 실패: {error_msg}")
+            token, refresh_token, error_msg = get_access_token(st.query_params["code"])
+            if token:
+                _store_token(token, refresh_token)
+                st.query_params.clear()
+                st.rerun()
+            else:
+                st.error(f"🚨 토큰 발급 실패: {error_msg}")
+                st.query_params.clear()
 
-    if "access_token" not in st.session_state:
+    if not ensure_valid_token():
         auth_url = (
             f"https://{MALL_ID}.cafe24api.com/api/v2/oauth/authorize?response_type=code"
-            f"&client_id={CLIENT_ID}&state=random&redirect_uri={urllib.parse.quote(REDIRECT_URI)}&scope={SCOPE}"
+            f"&client_id={CLIENT_ID}&state={_make_oauth_state()}"
+            f"&redirect_uri={urllib.parse.quote(REDIRECT_URI)}&scope={SCOPE}"
         )
-        # st.link_button은 항상 새 창(target=_blank)으로 열려 불필요한 창이 하나 더 뜨는 문제가 있어,
-        # target=_self로 바꿨더니 이번엔 Streamlit Cloud가 앱을 iframe으로 감싸서 호스팅하는 구조 때문에
-        # "현재 프레임"인 내부 iframe만 카페24로 이동했다가, 카페24가 우리 앱 URL로 되돌아올 때도
-        # 그 iframe 안에서 다시 로드하려다 꼬여 로그인 화면으로 되돌아오는 문제가 있었습니다.
-        # target=_top을 쓰면 iframe을 뚫고 나가 브라우저 탭(최상위 창) 전체를 이동시키므로,
-        # 새 창을 띄우지 않으면서도(=tab은 그대로) 최상위 수준에서 안전하게 왕복할 수 있습니다.
-        st.markdown(
-            f'<a href="{auth_url}" target="_top" '
-            f'style="display:inline-block;padding:0.6em 1.2em;background-color:#FF4B4B;'
-            f'color:white;border-radius:0.5em;text-decoration:none;font-weight:600;">'
-            f'🔐 카페24 로그인 및 연동하기</a>',
-            unsafe_allow_html=True,
-        )
+        # [되돌림] target=_self / target=_top 둘 다 시도했지만, Streamlit Cloud가 앱을
+        # iframe으로 감싸 호스팅하는 구조 때문에 실패했습니다.
+        #  - target=_self: iframe 안에서만 이동되어, 카페24 로그인 후 앱으로 되돌아오는 과정이
+        #    iframe 내에서 꼬여 로그인 화면으로 계속 되돌아가는 문제가 있었습니다.
+        #  - target=_top: iframe의 sandbox 정책이 최상위 창 이동 자체를 차단해 버튼이
+        #    아예 반응하지 않는 문제가 있었습니다.
+        # 결론적으로 Streamlit Cloud 환경에서는 새 창(st.link_button, target=_blank)으로 여는
+        # 방식만 안정적으로 동작하여 원래 방식으로 되돌립니다. (새 창이 뜨는 점은 감수합니다)
+        st.link_button("🔐 카페24 로그인 및 연동하기", auth_url, type="primary")
         st.stop()
     else:
-        st.success(f"✅ {MALL_ID} 연결 성공!")
+        st.success(f"✅ {MALL_ID} 연결 성공! (토큰 만료 시 자동 갱신됩니다)")
 
-    excel_mode = st.radio(
-        "📋 사용할 엑셀 양식을 선택하세요",
-        ["상세 양식 (품목별 상세 기록)", "간편 양식 (아이디 + 금액, 적립/차감 시트)"],
-        horizontal=True,
-    )
-    st.divider()
+    uploaded_file = st.file_uploader("📂 엑셀 파일 업로드", type=["xlsx", "xls", "csv"])
 
-    # ------------------------------------------------------------------
-    # 모드 A: 기존 상세 양식
-    # ------------------------------------------------------------------
-    if excel_mode == "상세 양식 (품목별 상세 기록)":
-        uploaded_file = st.file_uploader("📂 엑셀 파일 업로드 (상세 양식)", type=["xlsx", "xls", "csv"], key="detail_uploader")
+    if uploaded_file:
+        # 새 파일이 업로드되면 이전 파일의 합산/편집 상태가 남아있지 않도록 초기화
+        file_id = f"{uploaded_file.name}_{uploaded_file.size}"
+        if st.session_state.get('last_file_id') != file_id:
+            for k in ['cleaned_df', 'summary_df', 'db_confirm_step']:
+                st.session_state.pop(k, None)
+            st.session_state['last_file_id'] = file_id
 
-        if uploaded_file:
-            reset_state_if_new_file(uploaded_file, "detail")
-            try:
-                df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith(('xlsx', 'xls')) else pd.read_csv(uploaded_file)
-                df.columns = df.columns.astype(str).str.strip()
+        try:
+            df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith(('xlsx', 'xls')) else pd.read_csv(uploaded_file)
+            df.columns = df.columns.astype(str).str.strip()
 
-                amt_col = next((n for n in ['적립금액', '적립금', '금액', '결제금액'] if n in df.columns), None)
-                date_col = next((n for n in ['주문일', '주문일시', '날짜'] if n in df.columns), None)
+            amt_col = next((n for n in ['적립금액', '적립금', '금액', '결제금액'] if n in df.columns), None)
+            date_col = next((n for n in ['주문일', '주문일시', '날짜'] if n in df.columns), None)
+            req_cols = ['아이디', '주문자명', '고객명', '브랜드', '상품', '색상', '사이즈']
 
-                missing_req = [c for c in REQUIRED_COLS if c not in df.columns]
-                if missing_req:
-                    st.error(f"⚠️ 엑셀 파일에서 필수 컬럼을 찾을 수 없습니다: {', '.join(missing_req)}")
-                    st.stop()
-                if not date_col:
-                    st.error("⚠️ 엑셀 파일에서 '주문일' 컬럼을 찾을 수 없습니다.")
-                    st.stop()
-                if not amt_col:
-                    st.error("⚠️ 엑셀 파일에서 금액 관련 컬럼(적립금액/적립금/금액/결제금액)을 찾을 수 없습니다.")
-                    st.stop()
+            missing_cols = [c for c in req_cols if c not in df.columns]
+            if missing_cols:
+                st.error(f"⚠️ 엑셀 파일에 다음 필수 컬럼이 없습니다: {', '.join(missing_cols)}")
+                st.stop()
+            if not amt_col:
+                st.error("⚠️ 엑셀 파일에서 금액 컬럼(적립금액/적립금/금액/결제금액 중 하나)을 찾을 수 없습니다.")
+                st.stop()
+            if not date_col:
+                st.error("⚠️ 엑셀 파일에서 '주문일' 컬럼을 찾을 수 없습니다.")
+                st.stop()
 
-                target_df = df[REQUIRED_COLS + [date_col, amt_col]].copy()
-                target_df.columns = REQUIRED_COLS + ['주문일', '금액']
-                target_df['금액'] = pd.to_numeric(target_df['금액'], errors='coerce').fillna(0).astype(int)
-                target_df['주문일'] = target_df['주문일'].astype(str).str.strip()
-                for c in REQUIRED_COLS:
-                    target_df[c] = target_df[c].astype(str).str.strip()
+            target_df = df[req_cols + [date_col, amt_col]].copy()
+            target_df.columns = req_cols + ['주문일', '금액']
+            target_df['금액'] = target_df['금액'].apply(normalize_amount)
+            target_df['주문일'] = target_df['주문일'].astype(str).str.strip()
 
-                existing_keys = set()
-                # DB가 연결되어 있을 때만 중복 체크 실행
-                if st.session_state['db_connected'] and engine is not None:
-                    try:
-                        db_df = pd.read_sql(f"SELECT {', '.join(REQUIRED_COLS)}, 주문일, 금액 FROM mileage_records", con=engine)
-                        db_df['금액'] = pd.to_numeric(db_df['금액'], errors='coerce').fillna(0).astype(int)
-                        existing_keys = set(db_df.astype(str).apply(lambda x: '|'.join(x.fillna('')), axis=1).tolist())
-                    except Exception as e:
-                        st.warning(f"⚠️ 중복 체크용 DB 조회에 실패했습니다. 중복 체크 없이 진행합니다. (사유: {e})")
+            # 저장/비교 기준이 되는 정규화된 중복 방지 키를 미리 계산해둠
+            current_keys = target_df.apply(make_dedup_key, axis=1)
 
-                current_keys = target_df.astype(str).apply(lambda x: '|'.join(x.fillna('')), axis=1)
-                target_df['DB상태'] = current_keys.apply(lambda x: '🚨 중복' if x in existing_keys else '✅ 신규/DB없음')
-                target_df.insert(0, '삭제선택', False)
-                target_df.loc[target_df['DB상태'] == '🚨 중복', '삭제선택'] = True
+            existing_keys = set()
+            # DB가 연결되어 있을 때만 중복 체크 실행
+            if st.session_state['db_connected'] and engine is not None:
+                try:
+                    db_df = pd.read_sql("SELECT dedup_key FROM mileage_records", con=engine)
+                    existing_keys = set(db_df['dedup_key'].dropna().tolist())
+                except Exception as db_err:
+                    st.warning(f"⚠️ DB 중복 조회 중 오류가 발생해 중복 체크를 건너뜁니다: {db_err}")
 
-                duplicate_only = target_df[target_df['DB상태'] == '🚨 중복'].drop(columns=['삭제선택'])
-                if not duplicate_only.empty and st.session_state['db_connected']:
-                    st.download_button(
-                        label=f"📥 중복 데이터 다운로드 ({len(duplicate_only)}건)",
-                        data=make_excel_bytes(duplicate_only),
-                        file_name="duplicates.xlsx",
-                    )
+            target_df['DB상태'] = current_keys.apply(lambda x: '🚨 DB중복' if x in existing_keys else '✅ 신규')
+            # 업로드한 파일 자체에 동일한 행이 여러 번 있는 경우도 표시 (기존에는 감지되지 않던 부분)
+            dup_in_file = current_keys.duplicated(keep=False)
+            target_df.loc[dup_in_file & (target_df['DB상태'] == '✅ 신규'), 'DB상태'] = '⚠️ 파일내 중복'
 
-                edited_df = st.data_editor(target_df, hide_index=True, use_container_width=True, key="detail_editor")
+            target_df.insert(0, '삭제선택', False)
+            target_df.loc[target_df['DB상태'] != '✅ 신규', '삭제선택'] = True
 
-                if st.button("🔄 체크 항목 제외 후 합산하기", type="secondary"):
-                    cleaned = edited_df[edited_df['삭제선택'] == False].drop(columns=['삭제선택', 'DB상태'])
-                    if cleaned.empty:
-                        st.warning("⚠️ 합산할 데이터가 없습니다. (모든 항목이 제외되었습니다)")
-                    else:
-                        st.session_state['detail_cleaned_df'] = cleaned
-                        st.session_state['detail_summary_df'] = cleaned.groupby(
-                            ['아이디', '주문자명'], as_index=False
-                        ).agg({'고객명': 'first', '금액': 'sum'})
-                        st.rerun()
+            duplicate_only = target_df[target_df['DB상태'] != '✅ 신규'].drop(columns=['삭제선택'])
+            if not duplicate_only.empty:
+                dup_out = io.BytesIO()
+                with pd.ExcelWriter(dup_out, engine='xlsxwriter') as writer:
+                    duplicate_only.to_excel(writer, index=False)
+                st.download_button(label=f"📥 중복 데이터 다운로드 ({len(duplicate_only)}건)", data=dup_out.getvalue(), file_name="duplicates.xlsx")
 
-                if 'detail_summary_df' in st.session_state:
-                    st.divider()
-                    s_df = st.session_state['detail_summary_df']
-                    c1, c2 = st.columns(2)
-                    c1.metric("총 인원", f"{len(s_df)} 명")
-                    c2.metric("총 합계", f"{s_df['금액'].sum():,.0f} 원")
-                    st.dataframe(s_df, use_container_width=True, hide_index=True)
+            edited_df = st.data_editor(target_df, hide_index=True, use_container_width=True)
 
-                    action = st.radio("작업 선택", ["적립금 추가 (지급)", "적립금 차감 (회수)"], key="detail_action")
-                    reason = st.text_input("📝 사유 입력", key="detail_reason")
+            if st.button("🔄 체크 항목 제외 후 합산하기", type="secondary"):
+                cleaned = edited_df[edited_df['삭제선택'] == False].drop(columns=['삭제선택', 'DB상태'])
+                st.session_state['cleaned_df'] = cleaned
+                st.session_state['summary_df'] = cleaned.groupby(['아이디', '주문자명'], as_index=False).agg({'고객명': 'first', '금액': 'sum'})
+                st.rerun()
 
-                    b1, b2 = st.columns(2)
-                    with b1:
-                        if st.session_state['db_connected'] and engine is not None:
-                            if st.button("💾 1. 원본 상세 내역을 DB에 기록", use_container_width=True, type="secondary"):
-                                st.session_state['detail_db_confirm_step'] = True
-
-                            if st.session_state.get('detail_db_confirm_step'):
-                                st.warning("❓ 상세 내역을 DB에 저장하시겠습니까?")
-                                cc1, cc2 = st.columns(2)
-                                if cc1.button("⭕ 예 (저장)", use_container_width=True, key="detail_save_yes"):
-                                    try:
-                                        save_df = st.session_state['detail_cleaned_df'].copy()
-                                        save_df['비고'] = f"[{action}] {reason if reason.strip() else '상세내역 기록'}"
-                                        save_df['지급일시'] = datetime.now()
-                                        save_df.to_sql(name='mileage_records', con=engine, if_exists='append', index=False)
-                                        st.success("🎉 DB 저장 완료!")
-                                    except Exception as e:
-                                        st.error(f"🚨 DB 저장 실패: {e}")
-                                    st.session_state['detail_db_confirm_step'] = False
-                                if cc2.button("❌ 아니요 (취소)", use_container_width=True, key="detail_save_no"):
-                                    st.session_state['detail_db_confirm_step'] = False
-                                    st.rerun()
-                        else:
-                            st.info("💡 DB 연결 해제 모드: 내역이 DB에 저장되지 않습니다.")
-
-                    with b2:
-                        if st.button(f"🚀 2. 카페24로 {action} 실행", use_container_width=True, type="primary", key="detail_exec"):
-                            if not reason.strip():
-                                st.warning("⚠️ 사유를 입력해주세요.")
-                            else:
-                                success = 0
-                                failed_rows = []
-                                bar = st.progress(0)
-                                for i, (idx, row) in enumerate(s_df.iterrows()):
-                                    ok, err = send_points(st.session_state['access_token'], row['아이디'], row['금액'], action, reason)
-                                    if ok:
-                                        success += 1
-                                    else:
-                                        failed_rows.append({"아이디": row['아이디'], "주문자명": row['주문자명'], "금액": row['금액'], "오류": err})
-                                    bar.progress((i + 1) / len(s_df))
-
-                                st.success(f"🎉 카페24로 {success}/{len(s_df)}건 적립금 처리 완료!")
-
-                                # 처리 결과 로그는 DB 연결 여부와 무관하게 항상 다운로드 제공 (추적성 확보)
-                                log_df = s_df.copy()
-                                log_df['처리결과'] = log_df.apply(
-                                    lambda r: '실패' if r['아이디'] in [f['아이디'] for f in failed_rows] else '성공', axis=1
-                                )
-                                log_df['구분'] = action
-                                log_df['사유'] = reason
-                                log_df['처리시각'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                                st.download_button(
-                                    "📥 처리 결과 로그 다운로드", data=make_excel_bytes(log_df), file_name="처리결과_로그.xlsx"
-                                )
-
-                                if failed_rows:
-                                    st.error(f"⚠️ {len(failed_rows)}건 실패했습니다. 아래에서 확인하세요.")
-                                    fail_df = pd.DataFrame(failed_rows)
-                                    st.dataframe(fail_df, use_container_width=True, hide_index=True)
-                                    st.download_button(
-                                        "📥 실패 목록 다운로드", data=make_excel_bytes(fail_df), file_name="실패목록.xlsx", key="detail_fail_dl"
-                                    )
-
-            except Exception as e:
-                st.error(f"오류: {e}")
-
-    # ------------------------------------------------------------------
-    # 모드 B: 신규 간편 양식 (아이디 + 금액, 적립/차감 시트)
-    # ------------------------------------------------------------------
-    else:
-        st.caption("엑셀에 '아이디', '금액' 컬럼이 있으면 되고, 시트명이 '적립' / '차감'이면 자동으로 지급/차감을 구분합니다. (예: 첨부해주신 0713적립금관리.xlsx 형식)")
-        uploaded_file2 = st.file_uploader("📂 엑셀 파일 업로드 (간편 양식)", type=["xlsx", "xls"], key="simple_uploader")
-
-        if uploaded_file2:
-            reset_state_if_new_file(uploaded_file2, "simple")
-            try:
-                raw_df = load_simple_format(uploaded_file2)
-                if raw_df is None or raw_df.empty:
-                    st.error("⚠️ '아이디'와 '금액' 컬럼을 가진 시트를 찾을 수 없습니다. 파일 양식을 확인해주세요.")
-                    st.stop()
-
-                # 시트명만으로 적립/차감을 판별할 수 없는 경우, 사용자에게 직접 확인
-                unresolved_sheets = sorted(raw_df.loc[raw_df['구분'].isna(), '시트명'].unique().tolist())
-                if unresolved_sheets:
-                    st.warning("⚠️ 아래 시트는 이름만으로 적립/차감 여부를 알 수 없습니다. 직접 선택해주세요.")
-                    for sh in unresolved_sheets:
-                        choice = st.selectbox(f"시트 '{sh}' 는 무엇인가요?", ["적립", "차감"], key=f"simple_sheet_choice_{sh}")
-                        raw_df.loc[raw_df['시트명'] == sh, '구분'] = choice
-
-                # 아이디+구분 기준으로 합산 (같은 아이디가 여러 행에 걸쳐 있어도 안전하게 처리)
-                grouped = raw_df.groupby(['아이디', '구분'], as_index=False).agg({
-                    '주문자명': 'first',
-                    '금액': 'sum',
-                    '사유': lambda x: ' / '.join(sorted(set([s for s in x if s and str(s).lower() != 'nan']))),
-                    '날짜': 'first',
-                })
-                grouped = grouped[grouped['금액'] != 0]
-                if grouped.empty:
-                    st.error("⚠️ 유효한 금액이 있는 행이 없습니다.")
-                    st.stop()
-
-                # --- 중복 체크 (DB 연결 시, 아이디+날짜+금액+구분 기준) ---
-                # 비고에 "[적립]", "[차감]", 혹은 상세양식의 "[적립금 추가 (지급)]" 등이 남아있으므로
-                # 문자열에 '적립'/'차감'이 포함되는지로 구분을 역추정해 두 양식 간에도 중복을 잡아낸다.
-                existing_keys = set()
-                if st.session_state['db_connected'] and engine is not None:
-                    try:
-                        db_df = pd.read_sql("SELECT 아이디, 주문일, 금액, 비고 FROM mileage_records", con=engine)
-                        db_df['아이디'] = db_df['아이디'].astype(str).str.strip()
-                        db_df['주문일'] = db_df['주문일'].astype(str).str.strip()
-                        db_df['금액'] = pd.to_numeric(db_df['금액'], errors='coerce').fillna(0).astype(int)
-
-                        def _extract_action(remark):
-                            # 주의: "적립금 차감 (회수)"처럼 '차감' 문구 안에도 '적립'이라는 글자가
-                            # 포함되어 있으므로(적립금), 반드시 '차감'을 먼저 검사해야 한다.
-                            s = str(remark)
-                            if '차감' in s:
-                                return '차감'
-                            if '적립' in s:
-                                return '적립'
-                            return ''
-
-                        db_df['구분_추정'] = db_df['비고'].apply(_extract_action)
-                        existing_keys = set(
-                            (db_df['아이디'] + '|' + db_df['주문일'] + '|' + db_df['금액'].astype(str) + '|' + db_df['구분_추정']).tolist()
-                        )
-                    except Exception as e:
-                        st.warning(f"⚠️ 중복 체크용 DB 조회에 실패했습니다. 중복 체크 없이 진행합니다. (사유: {e})")
-
-                current_keys = (
-                    grouped['아이디'].astype(str).str.strip() + '|' +
-                    grouped['날짜'].astype(str).str.strip() + '|' +
-                    grouped['금액'].astype(int).astype(str) + '|' +
-                    grouped['구분'].astype(str)
-                )
-                grouped['DB상태'] = current_keys.apply(lambda x: '🚨 중복' if x in existing_keys else '✅ 신규/DB없음')
-                grouped.insert(0, '실행선택', True)
-                grouped.loc[grouped['DB상태'] == '🚨 중복', '실행선택'] = False
-
-                duplicate_only = grouped[grouped['DB상태'] == '🚨 중복'].drop(columns=['실행선택'])
-                if not duplicate_only.empty and st.session_state['db_connected']:
-                    st.download_button(
-                        label=f"📥 중복 데이터 다운로드 ({len(duplicate_only)}건)",
-                        data=make_excel_bytes(duplicate_only),
-                        file_name="간편양식_duplicates.xlsx",
-                    )
-
+            if 'summary_df' in st.session_state:
                 st.divider()
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("총 건수", f"{len(grouped)} 건")
-                c2.metric("적립 합계", f"{grouped.loc[grouped['구분']=='적립','금액'].sum():,.0f} 원")
-                c3.metric("차감 합계", f"{grouped.loc[grouped['구분']=='차감','금액'].sum():,.0f} 원")
-                c4.metric("🚨 중복 건수", f"{len(duplicate_only)} 건")
+                s_df = st.session_state['summary_df']
+                c1, c2 = st.columns(2)
+                c1.metric("총 인원", f"{len(s_df)} 명")
+                c2.metric("총 합계", f"{s_df['금액'].sum():,.0f} 원")
+                st.dataframe(s_df, use_container_width=True, hide_index=True)
 
-                edited = st.data_editor(grouped, hide_index=True, use_container_width=True, key="simple_editor")
-                common_reason = st.text_input("📝 공통 사유 (엑셀에 개별 사유가 없는 행에 사용됩니다)", key="simple_common_reason")
-
-                run_df = edited[edited['실행선택'] == True].drop(columns=['실행선택', 'DB상태'])
-                st.caption(f"실행 대상: {len(run_df)}건")
+                action = st.radio("작업 선택", ["적립금 추가 (지급)", "적립금 차감 (회수)"])
+                reason = st.text_input("📝 사유 입력")
 
                 b1, b2 = st.columns(2)
                 with b1:
+                    # DB가 연결된 상태에서만 DB 저장 버튼 표시
                     if st.session_state['db_connected'] and engine is not None:
-                        if st.button("💾 1. 내역을 DB에 기록", use_container_width=True, type="secondary", key="simple_db_btn"):
-                            st.session_state['simple_db_confirm_step'] = True
+                        if st.button("💾 1. 원본 상세 내역을 DB에 기록", use_container_width=True, type="secondary"):
+                            st.session_state['db_confirm_step'] = True
 
-                        if st.session_state.get('simple_db_confirm_step'):
-                            st.warning("❓ 위 내역을 DB에 저장하시겠습니까?")
+                        if st.session_state.get('db_confirm_step'):
+                            st.warning("❓ 상세 내역을 DB에 저장하시겠습니까?")
                             cc1, cc2 = st.columns(2)
-                            if cc1.button("⭕ 예 (저장)", use_container_width=True, key="simple_save_yes"):
+                            if cc1.button("⭕ 예 (저장)", use_container_width=True):
+                                save_df = st.session_state['cleaned_df'].copy()
+                                save_df['금액'] = save_df['금액'].apply(normalize_amount)
+                                save_df['비고'] = f"[{action}] {reason if reason.strip() else '상세내역 기록'}"
+                                save_df['지급일시'] = datetime.now()
+                                save_df['dedup_key'] = save_df.apply(make_dedup_key, axis=1)
                                 try:
-                                    save_df = pd.DataFrame({
-                                        '아이디': run_df['아이디'],
-                                        '주문자명': run_df['주문자명'],
-                                        '고객명': run_df['주문자명'],
-                                        '브랜드': '',
-                                        '상품': '',
-                                        '색상': '',
-                                        '사이즈': '',
-                                        '주문일': run_df['날짜'],
-                                        '금액': run_df['금액'],
-                                        '비고': run_df.apply(
-                                            lambda r: f"[{r['구분']}] {r['사유'] if r['사유'] else (common_reason or '간편양식 기록')}", axis=1
-                                        ),
-                                        '지급일시': datetime.now(),
-                                    })
                                     save_df.to_sql(name='mileage_records', con=engine, if_exists='append', index=False)
                                     st.success("🎉 DB 저장 완료!")
-                                except Exception as e:
-                                    st.error(f"🚨 DB 저장 실패: {e}")
-                                st.session_state['simple_db_confirm_step'] = False
-                            if cc2.button("❌ 아니요 (취소)", use_container_width=True, key="simple_save_no"):
-                                st.session_state['simple_db_confirm_step'] = False
+                                except Exception as save_err:
+                                    st.error(f"🚨 DB 저장 중 오류 (중복 데이터일 수 있습니다): {save_err}")
+                                st.session_state['db_confirm_step'] = False
+                            if cc2.button("❌ 아니요 (취소)", use_container_width=True):
+                                st.session_state['db_confirm_step'] = False
                                 st.rerun()
                     else:
                         st.info("💡 DB 연결 해제 모드: 내역이 DB에 저장되지 않습니다.")
 
                 with b2:
-                    if st.button("🚀 2. 카페24로 일괄 실행 (적립/차감 자동 구분)", use_container_width=True, type="primary", key="simple_exec"):
-                        if run_df.empty:
-                            st.warning("⚠️ 실행할 항목이 없습니다.")
+                    if st.button(f"🚀 2. 카페24로 {action} 실행", use_container_width=True, type="primary"):
+                        if not reason.strip():
+                            st.warning("⚠️ 사유를 입력해주세요.")
+                        elif not ensure_valid_token():
+                            st.error("🚨 인증 토큰이 유효하지 않습니다. 새로고침 후 다시 로그인해주세요.")
                         else:
+                            url = f"https://{MALL_ID}.cafe24api.com/api/v2/admin/points"
+                            headers = {
+                                "Authorization": f"Bearer {st.session_state['access_token']}",
+                                "Content-Type": "application/json",
+                                "X-Cafe24-Api-Version": "2026-03-01",
+                            }
+                            api_type = "increase" if "추가" in action else "decrease"
                             success = 0
                             failed_rows = []
                             bar = st.progress(0)
-                            for i, (idx, row) in enumerate(run_df.iterrows()):
-                                reason = row['사유'] if row['사유'] else common_reason
-                                if not str(reason).strip():
-                                    failed_rows.append({"아이디": row['아이디'], "주문자명": row['주문자명'], "금액": row['금액'], "구분": row['구분'], "오류": "사유 없음 (건너뜀)"})
-                                    bar.progress((i + 1) / len(run_df))
-                                    continue
-                                ok, err = send_points(st.session_state['access_token'], row['아이디'], row['금액'], row['구분'], reason)
-                                if ok:
-                                    success += 1
-                                else:
-                                    failed_rows.append({"아이디": row['아이디'], "주문자명": row['주문자명'], "금액": row['금액'], "구분": row['구분'], "오류": err})
-                                bar.progress((i + 1) / len(run_df))
+                            total = len(s_df)
+                            for i, (idx, row) in enumerate(s_df.iterrows()):
+                                payload = {"request": {
+                                    "member_id": str(row['아이디']).strip(),
+                                    "amount": abs(normalize_amount(row['금액'])),
+                                    "type": api_type,
+                                    "reason": reason,
+                                }}
+                                try:
+                                    res = requests.post(url, json=payload, headers=headers, timeout=15)
+                                    if res.status_code in (200, 201):
+                                        success += 1
+                                    else:
+                                        failed_rows.append({
+                                            "아이디": row['아이디'], "주문자명": row['주문자명'],
+                                            "금액": row['금액'], "실패사유": res.text[:300],
+                                        })
+                                except requests.RequestException as req_err:
+                                    failed_rows.append({
+                                        "아이디": row['아이디'], "주문자명": row['주문자명'],
+                                        "금액": row['금액'], "실패사유": str(req_err),
+                                    })
+                                bar.progress((i + 1) / total)
 
-                            st.success(f"🎉 카페24로 {success}/{len(run_df)}건 처리 완료!")
-
-                            log_df = run_df.copy()
-                            failed_ids = {f['아이디'] for f in failed_rows}
-                            log_df['처리결과'] = log_df['아이디'].apply(lambda x: '실패' if x in failed_ids else '성공')
-                            log_df['처리시각'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                            st.download_button(
-                                "📥 처리 결과 로그 다운로드", data=make_excel_bytes(log_df), file_name="간편양식_처리결과_로그.xlsx"
-                            )
-
+                            st.success(f"🎉 카페24로 {success}건 적립금 처리 완료! (실패 {len(failed_rows)}건)")
                             if failed_rows:
-                                st.error(f"⚠️ {len(failed_rows)}건 실패/건너뜀. 아래에서 확인하세요.")
                                 fail_df = pd.DataFrame(failed_rows)
+                                st.error("아래 목록은 처리에 실패했습니다. 사유 확인 후 재시도해주세요.")
                                 st.dataframe(fail_df, use_container_width=True, hide_index=True)
-                                st.download_button(
-                                    "📥 실패 목록 다운로드", data=make_excel_bytes(fail_df), file_name="간편양식_실패목록.xlsx", key="simple_fail_dl"
-                                )
+                                fbuf = io.BytesIO()
+                                with pd.ExcelWriter(fbuf, engine='xlsxwriter') as w:
+                                    fail_df.to_excel(w, index=False)
+                                st.download_button(label="📥 실패 목록 다운로드", data=fbuf.getvalue(), file_name="failed_points.xlsx")
 
-            except Exception as e:
-                st.error(f"오류: {e}")
+        except Exception as e:
+            st.error(f"오류: {e}")
 
 # ==========================================
 # 화면 2 & 3: DB 관련 화면 (DB 없을 시 차단)
@@ -574,27 +518,22 @@ elif menu in ["기록 조회 및 다운로드", "DB 기록 삭제"]:
         st.title("🔍 DB 기록 조회 및 다운로드")
         try:
             raw_df = pd.read_sql("SELECT * FROM mileage_records ORDER BY 지급일시 DESC", con=engine)
-        except Exception as e:
-            st.error(f"🚨 DB 조회 실패: {e}")
-            st.stop()
-
-        if raw_df.empty:
-            st.info("기록이 없습니다.")
-        else:
             c1, c2, c3 = st.columns(3)
             sid, sname, srs = c1.text_input("아이디"), c2.text_input("이름"), c3.text_input("사유")
             f_df = raw_df.copy()
-            if sid:
-                f_df = f_df[f_df['아이디'].str.contains(sid, na=False)]
-            if sname:
-                f_df = f_df[f_df['주문자명'].str.contains(sname, na=False)]
-            if srs:
-                f_df = f_df[f_df['비고'].str.contains(srs, na=False)]
-            st.dataframe(f_df, use_container_width=True, hide_index=True)
-            if not f_df.empty:
-                st.download_button(label="📥 결과 다운로드", data=make_excel_bytes(f_df), file_name="history.xlsx")
+            if sid: f_df = f_df[f_df['아이디'].str.contains(sid, na=False)]
+            if sname: f_df = f_df[f_df['주문자명'].str.contains(sname, na=False)]
+            if srs: f_df = f_df[f_df['비고'].str.contains(srs, na=False)]
+            if f_df.empty:
+                st.info("조건에 맞는 기록이 없습니다.")
             else:
-                st.info("검색 조건에 맞는 기록이 없습니다.")
+                st.dataframe(f_df, use_container_width=True, hide_index=True)
+                out = io.BytesIO()
+                with pd.ExcelWriter(out, engine='xlsxwriter') as w:
+                    f_df.to_excel(w, index=False)
+                st.download_button(label="📥 결과 다운로드", data=out.getvalue(), file_name="history.xlsx")
+        except Exception as e:
+            st.error(f"조회 중 오류가 발생했습니다: {e}")
 
     elif menu == "DB 기록 삭제":
         st.title("🗑️ DB 기록 삭제 (묶음별)")

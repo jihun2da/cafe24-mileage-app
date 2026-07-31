@@ -5,7 +5,9 @@ import requests
 import base64
 import urllib.parse
 import io
-import uuid
+import hmac
+import hashlib
+import time
 from datetime import datetime
 
 # --- [페이지 설정] ---
@@ -266,9 +268,37 @@ def ensure_valid_token():
     return 'access_token' in st.session_state
 
 
-# OAuth state 값 (CSRF 방지용, 세션마다 고정된 랜덤값 사용)
-if 'oauth_state' not in st.session_state:
-    st.session_state['oauth_state'] = uuid.uuid4().hex
+# ==========================================
+# [수정] OAuth state(CSRF 방지) 값을 세션 상태에 의존하지 않고 생성/검증합니다.
+#  - 카페24 로그인 페이지로 이동했다가 redirect_uri로 되돌아오는 과정은
+#    브라우저의 완전한 풀 리로드(새 페이지 로드)이기 때문에, 그 사이에
+#    Streamlit의 st.session_state는 통째로 초기화됩니다.
+#  - 따라서 로그인 이전에 session_state에 저장해둔 state 값과, 로그인 후 돌아왔을 때의
+#    session_state를 비교하는 방식은 항상 실패해서 "인증 상태값이 일치하지 않습니다"
+#    에러가 반복되고, 로그인 화면을 절대 벗어나지 못하는 무한 루프에 빠지는 버그가 있었습니다.
+#  - 세션 없이도 검증 가능하도록 타임스탬프 + HMAC 서명 조합의 stateless state 값을 사용합니다.
+# ==========================================
+OAUTH_STATE_MAX_AGE_SEC = 600  # state 값 유효 시간(초). 이 시간 내에 로그인을 완료해야 합니다.
+
+
+def _make_oauth_state():
+    ts = str(int(time.time()))
+    sig = hmac.new(CLIENT_SECRET.encode('utf-8'), ts.encode('utf-8'), hashlib.sha256).hexdigest()
+    return f"{ts}.{sig}"
+
+
+def _verify_oauth_state(state_value):
+    if not state_value or "." not in state_value:
+        return False
+    ts_str, sig = state_value.split(".", 1)
+    expected_sig = hmac.new(CLIENT_SECRET.encode('utf-8'), ts_str.encode('utf-8'), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected_sig):
+        return False
+    try:
+        return (time.time() - int(ts_str)) <= OAUTH_STATE_MAX_AGE_SEC
+    except ValueError:
+        return False
+
 
 # --- [사이드바 메뉴] ---
 st.sidebar.title("🚀 메뉴 선택")
@@ -282,8 +312,8 @@ if menu == "적립금 지급하기":
 
     if "code" in st.query_params and "access_token" not in st.session_state:
         returned_state = st.query_params.get("state")
-        if returned_state != st.session_state.get('oauth_state'):
-            st.error("🚨 인증 상태값이 일치하지 않습니다. 아래 버튼으로 다시 로그인해주세요.")
+        if not _verify_oauth_state(returned_state):
+            st.error("🚨 인증 요청이 만료되었거나 위조되었을 수 있습니다. 아래 버튼으로 다시 로그인해주세요.")
             st.query_params.clear()
         else:
             token, refresh_token, error_msg = get_access_token(st.query_params["code"])
@@ -298,7 +328,7 @@ if menu == "적립금 지급하기":
     if not ensure_valid_token():
         auth_url = (
             f"https://{MALL_ID}.cafe24api.com/api/v2/oauth/authorize?response_type=code"
-            f"&client_id={CLIENT_ID}&state={st.session_state['oauth_state']}"
+            f"&client_id={CLIENT_ID}&state={_make_oauth_state()}"
             f"&redirect_uri={urllib.parse.quote(REDIRECT_URI)}&scope={SCOPE}"
         )
         # st.link_button은 항상 새 창(target=_blank)으로 열려 불필요한 창이 하나 더 뜨는 문제가 있어,

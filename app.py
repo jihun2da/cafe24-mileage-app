@@ -220,10 +220,13 @@ if menu == "적립금 지급하기":
             f"&client_id={CLIENT_ID}&state=random&redirect_uri={urllib.parse.quote(REDIRECT_URI)}&scope={SCOPE}"
         )
         # st.link_button은 항상 새 창(target=_blank)으로 열려 불필요한 창이 하나 더 뜨는 문제가 있어,
-        # target=_self 앵커로 대체해 현재 탭에서 그대로 카페24 로그인 페이지로 이동하도록 처리합니다.
-        # (다른 수정사항은 전부 제외하고 이 변경 하나만 적용한 격리 테스트 버전입니다)
+        # target=_self로 바꿨더니 이번엔 Streamlit Cloud가 앱을 iframe으로 감싸서 호스팅하는 구조 때문에
+        # "현재 프레임"인 내부 iframe만 카페24로 이동했다가, 카페24가 우리 앱 URL로 되돌아올 때도
+        # 그 iframe 안에서 다시 로드하려다 꼬여 로그인 화면으로 되돌아오는 문제가 있었습니다.
+        # target=_top을 쓰면 iframe을 뚫고 나가 브라우저 탭(최상위 창) 전체를 이동시키므로,
+        # 새 창을 띄우지 않으면서도(=tab은 그대로) 최상위 수준에서 안전하게 왕복할 수 있습니다.
         st.markdown(
-            f'<a href="{auth_url}" target="_self" '
+            f'<a href="{auth_url}" target="_top" '
             f'style="display:inline-block;padding:0.6em 1.2em;background-color:#FF4B4B;'
             f'color:white;border-radius:0.5em;text-decoration:none;font-weight:600;">'
             f'🔐 카페24 로그인 및 연동하기</a>',

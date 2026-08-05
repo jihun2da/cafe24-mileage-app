@@ -32,7 +32,15 @@ def normalize_amount(x):
 
 
 def make_dedup_key(row):
-    parts = [str(row.get(c, '') or '').strip() for c in DEDUP_COLS]
+    # [버그 수정] row.get(c, '') or '' 방식은 셀 값이 pandas의 nullable NA(pd.NA)일 때
+    # "boolean value of NA is ambiguous" 에러를 던져 DB 저장이 실패하는 문제가 있었습니다.
+    # (엑셀에서 특정 컬럼이 nullable string/Int64 dtype으로 읽히고 빈 셀이 있으면 발생)
+    # pd.isna()로 명시적으로 결측 여부를 판별해 이 문제를 피합니다.
+    parts = []
+    for c in DEDUP_COLS:
+        v = row.get(c, '')
+        v = '' if pd.isna(v) else v
+        parts.append(str(v).strip())
     parts.append(str(normalize_amount(row.get('금액', 0))))
     return '|'.join(parts)
 
